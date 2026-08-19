@@ -13,7 +13,7 @@ coordinator/
   src/logic.js          pure request logic. storage, verifier, clock and uuid source injected.
   src/worker.js         thin adapter: route parsing, webcrypto ed25519 verify, kv i/o.
   test/logic.test.mjs   node --test suite against logic.js.
-  wrangler.toml         deploy config. kv ids are placeholders.
+  wrangler.toml         deploy config. the kv id in it is the live production namespace.
 ```
 
 every branch decision lives in `logic.js`. `worker.js` decides nothing, so the whole
@@ -166,23 +166,28 @@ fits, and every kv value stays far under the 25 MiB kv value cap.
 
 ## deploying
 
-not deployed by this workflow. before a first deploy:
+deployed. `wrangler.toml` carries the real production namespace id and the
+`grid.newyorkcomputeclub.com` custom domain route, so `wrangler deploy` from this
+directory ships to the live coordinator. treat it that way.
+
+there is no preview namespace. `wrangler dev` on its own is fine, it simulates kv
+locally, but `wrangler dev --remote` needs one and must not borrow the production id:
 
 ```
-wrangler kv namespace create GRID
 wrangler kv namespace create GRID --preview
 ```
 
-put the two ids into `wrangler.toml`, replacing the placeholders, then `wrangler deploy`.
+then add the id it prints as `preview_id` under `[[kv_namespaces]]`. a dev run against
+the production namespace can overwrite a live job record or a node's registered key.
 
 ## status, honestly
 
-- **`src/worker.js` ships untested.** it has never been deployed and never been run
-  against a real workers runtime. the test suite covers `src/logic.js` only. the
-  adapter's webcrypto ed25519 import, the kv adapter, and the request parsing are
-  unexercised code. treat the first deploy as the first test.
+- **`src/worker.js` ships untested.** it is deployed and it has served real requests, but
+  the test suite covers `src/logic.js` only. the adapter's webcrypto ed25519 import, the kv
+  adapter, and the request parsing have no automated coverage in any environment; what is
+  known about them is whatever the live deployment has happened to exercise.
 - ed25519 in webcrypto is named differently across workers runtime versions, so
-  `worker.js` tries two spellings. which one your compatibility date gets is unverified.
+  `worker.js` tries two spellings. which one this compatibility date gets is unverified.
 - `POST /v1/jobs` is unauthenticated. anyone who can reach the worker can queue work
   onto a member's gpu, up to the per-node cap. there is no client identity and no quota.
 - first-time `POST /v1/nodes/register` is unauthenticated. it proves possession of the

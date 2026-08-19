@@ -22,14 +22,14 @@ coordinator hands out the keys you seal to.
 ```
 pygrid/
   crypto.py      sealed boxes, ed25519 signing, the canonical signed request string
-  protocol.py    NodeInfo and JobEnvelope, json serde, liveness rule
+  protocol.py    NodeInfo and JobEnvelope, json serde. no liveness rule, see below
   node.py        NodeAgent, node cli
   client.py      GridClient, client cli
   testkit.py     MockCoordinator and MockEngine for local runs
 coordinator/
   src/logic.js   pure routing and state machine logic, tested with node --test
   src/worker.js  thin adapter: routes, webcrypto verify, KV io. ships untested
-  wrangler.toml  deploy config. deploy has not been run
+  wrangler.toml  deploy config. real production kv id, live custom domain
 tests/           pytest, loopback only
 docs/            threat model
 ```
@@ -86,6 +86,11 @@ print(client.result(job_id, timeout=60))
 `submit()` with no `to_node` auto-picks the alive node advertising the lowest wattage.
 wattage is self reported and nothing measures it, so a hostile node can claim 0 watts and win
 every auto-picked job on the grid. pass `to_node` explicitly when that matters.
+
+"alive" is the coordinator's flag on each `GET /v1/nodes` record, and the client reads it
+rather than recomputing one. there is exactly one liveness rule, in `logic.js`: three missed
+30 second heartbeats. a second copy in python would have to know the unit of `last_seen`,
+which is milliseconds from the worker and seconds from the test mock.
 
 the reply keypair is ephemeral and per job, generated in the client process and never sent
 anywhere except its public half. that means `result()` only works from the same process that
@@ -194,9 +199,11 @@ way to catch it.
 - **the protocol is at least once.** KV is eventually consistent, so a node can see a job
   twice and a client can read stale status for a moment. that is why monotonic transitions
   and idempotent result posts are load bearing rather than tidy.
-- **`worker.js` ships untested and undeployed.** its logic lives in `logic.js`, which is
-  tested. the adapter around it, route parsing plus webcrypto verify plus KV io, has never run
-  against a real cloudflare edge in this repo.
+- **`worker.js` ships untested.** its logic lives in `logic.js`, which is tested. the adapter
+  around it, route parsing plus webcrypto verify plus KV io, has no automated coverage; it is
+  deployed at `grid.newyorkcomputeclub.com` and the live edge is the only thing exercising it.
+  `wrangler.toml` names the production KV namespace and has no preview namespace, so
+  `wrangler dev --remote` is not wired up on purpose. see `coordinator/README.md`.
 - **no scheduling, no fairness, no billing.** jobs go to one node, in order, and nothing
   tracks who used how much of whose gpu.
 

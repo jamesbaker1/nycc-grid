@@ -2,7 +2,12 @@
 *.keys.json
 node-keys.json
 keys/
+# `client submit --job-file` writes the ephemeral reply PRIVATE key in cleartext.
+# the readme's example uses the bare name job.json, which *.job.json does not match,
+# so the bare name is listed too. anyone who gets this file can read the result.
+job.json
 *.job.json
+*-job.json
 .dev.vars
 .env
 .env.*

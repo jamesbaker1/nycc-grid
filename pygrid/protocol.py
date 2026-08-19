@@ -2,12 +2,17 @@
 
 nothing here is secret: NodeInfo is what GET /v1/nodes publishes to anyone, and
 JobEnvelope carries ciphertext plus routing metadata.
+
+there is no liveness helper here on purpose. the coordinator owns that rule and
+publishes the answer as the `alive` field on each GET /v1/nodes record, which is what
+client.pick_node() reads. recomputing it here would need the unit of last_seen, and
+that is not one unit: the deployed worker stores Date.now() milliseconds while
+testkit's MockCoordinator stores unix seconds. consume `alive`.
 """
 
 from __future__ import annotations
 
 import json
-import time
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping, Type, TypeVar
 
@@ -15,10 +20,9 @@ from typing import Any, Mapping, Type, TypeVar
 JOB_STATUSES = ("queued", "running", "done", "failed")
 TERMINAL_STATUSES = ("done", "failed")
 
-# nodes heartbeat every HEARTBEAT_S; a node is stale after STALE_INTERVALS missed ones.
+# how often node.py heartbeats. the coordinator calls a node stale after three missed
+# ones (logic.js STALE_MS); it applies that rule itself, see the module docstring.
 HEARTBEAT_S = 30.0
-STALE_INTERVALS = 3
-STALE_AFTER_S = HEARTBEAT_S * STALE_INTERVALS
 
 T = TypeVar("T", bound="_Serde")
 
@@ -26,11 +30,8 @@ __all__ = [
     "JOB_STATUSES",
     "TERMINAL_STATUSES",
     "HEARTBEAT_S",
-    "STALE_INTERVALS",
-    "STALE_AFTER_S",
     "NodeInfo",
     "JobEnvelope",
-    "is_alive",
     "to_json",
     "from_json",
 ]
@@ -67,6 +68,13 @@ class _Serde:
 
 @dataclass
 class NodeInfo(_Serde):
+    """one GET /v1/nodes record, minus the coordinator-computed `alive` flag.
+
+    last_seen carries whatever unit the coordinator wrote (milliseconds from the
+    deployed worker), so it is a display and ordering value here, not something to
+    compare against local time. read `alive` off the raw record for liveness.
+    """
+
     node_id: str
     pubkey: str
     verify_key: str
@@ -82,9 +90,6 @@ class NodeInfo(_Serde):
             wattage=float(data.get("wattage") or 0.0),
             last_seen=float(data.get("last_seen") or 0.0),
         )
-
-    def is_alive(self, now: float | None = None) -> bool:
-        return is_alive(self.last_seen, now)
 
 
 @dataclass
@@ -108,14 +113,6 @@ class JobEnvelope(_Serde):
             reply_pubkey=str(_req(data, "reply_pubkey")),
             status=str(data.get("status") or "queued"),
         )
-
-
-def is_alive(last_seen: float, now: float | None = None, stale_after: float = STALE_AFTER_S) -> bool:
-    """liveness rule shared by client auto-pick and GET /v1/nodes."""
-    if not last_seen:
-        return False
-    now = time.time() if now is None else now
-    return (now - float(last_seen)) <= stale_after
 
 
 def to_json(obj: Any) -> str:

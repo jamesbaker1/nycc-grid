@@ -8,10 +8,17 @@ routes = [
 ]
 
 # zero npm deps. src/logic.js is plain esm and is the only thing under test.
+#
+# id is the real production namespace, live behind grid.newyorkcomputeclub.com. there is
+# deliberately no preview_id: it used to be a copy of the id above, which pointed
+# `wrangler dev --remote` at production keys, so a dev run could overwrite a member's job
+# record. create a second namespace before the next remote dev run and put it here:
+#   wrangler kv namespace create GRID --preview
+# until then `wrangler dev --remote` fails loudly, which is the outcome we want, and
+# plain `wrangler dev` keeps using its local simulated kv.
 [[kv_namespaces]]
 binding = "GRID"
 id = "f62544982bf242ff8e4580414b9b9669"
-preview_id = "f62544982bf242ff8e4580414b9b9669"
 
 [observability]
 enabled = true

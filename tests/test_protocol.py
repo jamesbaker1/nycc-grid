@@ -119,17 +119,15 @@ def test_unknown_status_is_rejected(status):
         )
 
 
-def test_liveness_rule_is_three_heartbeat_intervals():
-    assert protocol.STALE_AFTER_S == protocol.HEARTBEAT_S * protocol.STALE_INTERVALS
-    now = 10_000.0
-    assert protocol.is_alive(now - protocol.HEARTBEAT_S, now) is True
-    assert protocol.is_alive(now - protocol.STALE_AFTER_S + 1, now) is True
-    assert protocol.is_alive(now - protocol.STALE_AFTER_S - 1, now) is False
-    assert protocol.is_alive(0.0, now) is False
+def test_heartbeat_interval_matches_the_coordinator():
+    # logic.js: HEARTBEAT_S = 30, STALE_MS = 3 * HEARTBEAT_S * 1000. node.py heartbeats
+    # on this constant, so drifting it apart from the worker makes nodes read stale.
+    assert protocol.HEARTBEAT_S == 30.0
 
 
-def test_nodeinfo_is_alive_method_matches():
-    now = 10_000.0
-    node = NodeInfo("n", "p", "v", 0.0, now - 1.0)
-    assert node.is_alive(now) is True
-    assert NodeInfo("n", "p", "v", 0.0, now - 1e6).is_alive(now) is False
+def test_no_local_liveness_rule():
+    # liveness is the coordinator's to compute and it ships as the `alive` field. a
+    # helper here would have to guess the unit of last_seen (worker: ms, testkit: s).
+    assert not hasattr(protocol, "is_alive")
+    assert not hasattr(NodeInfo, "is_alive")
+    assert "alive" not in NodeInfo.__dataclass_fields__
