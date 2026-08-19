@@ -1,4 +1,5 @@
 import base64
+import json
 
 import pytest
 from nacl.exceptions import CryptoError
@@ -181,3 +182,116 @@ def test_signed_headers_nonce_is_fresh_per_request():
     two = crypto.signed_headers("n", sign_b64, url, "POST", b"{}")
     assert one["X-NYCC-Nonce"] != two["X-NYCC-Nonce"]
     assert one["X-NYCC-Signature"] != two["X-NYCC-Signature"]
+
+
+# ---------------------------------------------------- canonical json documents
+
+
+def test_canonical_json_is_sorted_compact_utf8():
+    raw = crypto.canonical_json({"b": 1, "a": "x", "c": [1, 2]})
+    assert raw == b'{"a":"x","b":1,"c":[1,2]}'
+    assert isinstance(raw, bytes)
+
+
+def test_canonical_json_ignores_key_insertion_order():
+    # the whole point: a verifier rebuilds the dict from json and gets the same bytes
+    doc = {"serial": 7, "member": "j. baker", "issued": "2026-08-19T00:00:00Z"}
+    shuffled = {k: doc[k] for k in reversed(list(doc))}
+    assert crypto.canonical_json(doc) == crypto.canonical_json(shuffled)
+    assert crypto.canonical_json(json.loads(json.dumps(doc, indent=4))) == crypto.canonical_json(doc)
+
+
+def test_canonical_json_signature_survives_a_json_roundtrip():
+    # a receipt is signed by the node, serialized, stored by the coordinator, and
+    # re-parsed by the client. the signature has to survive all of that.
+    verify_b64, sign_b64 = crypto.sign_keygen()
+    receipt = {
+        "job_id": "j1",
+        "node_id": "node-gowanus",
+        "duration_ms": 812,
+        "watts": 65.0,
+        "watts_source": "claimed",
+        "request_sha256": "aa" * 32,
+        "result_sha256": "bb" * 32,
+    }
+    sig = crypto.sign(sign_b64, crypto.canonical_json(receipt))
+    reparsed = json.loads(json.dumps({"receipt": receipt, "sig": crypto.b64e(sig)}))
+    assert crypto.verify(
+        verify_b64, crypto.canonical_json(reparsed["receipt"]), crypto.b64d(reparsed["sig"])
+    ) is True
+
+
+def test_canonical_json_signature_breaks_on_any_edit():
+    verify_b64, sign_b64 = crypto.sign_keygen()
+    receipt = {"job_id": "j1", "watts": 65.0, "duration_ms": 812}
+    sig = crypto.sign(sign_b64, crypto.canonical_json(receipt))
+    for field, value in [("watts", 5.0), ("duration_ms", 811), ("job_id", "j2")]:
+        tampered = dict(receipt, **{field: value})
+        assert crypto.verify(verify_b64, crypto.canonical_json(tampered), sig) is False
+
+
+# ------------------------------------------------------ member (card) signatures
+
+
+def test_member_headers_are_the_same_bytes_as_node_headers():
+    # one canonicalization in the grid. same key, same request, same timestamp and
+    # nonce: the signature must be identical and only the header names differ.
+    _, sign_b64 = crypto.sign_keygen()
+    url = "http://127.0.0.1:9/v1/jobs"
+    body = b'{"to_node":"node-1"}'
+    node = crypto.signed_headers("node-1", sign_b64, url, "POST", body, timestamp=1700000000, nonce="bm9uY2U=")
+    member = crypto.member_signed_headers(sign_b64, url, "POST", body, timestamp=1700000000, nonce="bm9uY2U=")
+    assert member["X-NYCC-Member-Sig"] == node["X-NYCC-Signature"]
+    assert member["X-NYCC-Member-Ts"] == node["X-NYCC-Timestamp"] == "1700000000"
+    assert member["X-NYCC-Member-Nonce"] == node["X-NYCC-Nonce"] == "bm9uY2U="
+
+
+def test_member_headers_carry_no_node_id():
+    # the member identity is in the card, not in the signed string and not in a header
+    # the coordinator would otherwise have to trust.
+    _, sign_b64 = crypto.sign_keygen()
+    headers = crypto.member_signed_headers(sign_b64, "http://h/v1/jobs", "POST", b"{}")
+    assert set(headers) == {"X-NYCC-Member-Ts", "X-NYCC-Member-Nonce", "X-NYCC-Member-Sig"}
+
+
+def test_member_signature_verifies_against_the_canonical_message():
+    verify_b64, sign_b64 = crypto.sign_keygen()
+    url = "http://127.0.0.1:9/v1/jobs"
+    body = b'{"to_node":"node-1","blob_b64":"AA=="}'
+    headers = crypto.member_signed_headers(sign_b64, url, "POST", body)
+    host, path = crypto.split_target(url)
+    msg = crypto.signing_message(
+        host, "POST", path, headers["X-NYCC-Member-Ts"], headers["X-NYCC-Member-Nonce"], body
+    )
+    sig = base64.b64decode(headers["X-NYCC-Member-Sig"])
+    assert crypto.verify(verify_b64, msg, sig) is True
+    # a coordinator that verified the wrong body, or the wrong member key, must fail
+    assert crypto.verify(verify_b64, msg[:-1], sig) is False
+    other_verify, _ = crypto.sign_keygen()
+    assert crypto.verify(other_verify, msg, sig) is False
+
+
+def test_member_nonce_is_fresh_per_request():
+    _, sign_b64 = crypto.sign_keygen()
+    one = crypto.member_signed_headers(sign_b64, "http://h/v1/jobs", "POST", b"{}")
+    two = crypto.member_signed_headers(sign_b64, "http://h/v1/jobs", "POST", b"{}")
+    assert one["X-NYCC-Member-Nonce"] != two["X-NYCC-Member-Nonce"]
+    assert one["X-NYCC-Member-Sig"] != two["X-NYCC-Member-Sig"]
+
+
+def test_header_names_are_pinned_constants():
+    # the worker reads these lowercase; changing either side alone breaks submission
+    assert crypto.NODE_ID_HEADER == "X-NYCC-Node-Id"
+    assert crypto.TIMESTAMP_HEADER == "X-NYCC-Timestamp"
+    assert crypto.NONCE_HEADER == "X-NYCC-Nonce"
+    assert crypto.SIGNATURE_HEADER == "X-NYCC-Signature"
+    assert crypto.CARD_HEADER == "X-NYCC-Card"
+    assert crypto.MEMBER_TIMESTAMP_HEADER == "X-NYCC-Member-Ts"
+    assert crypto.MEMBER_NONCE_HEADER == "X-NYCC-Member-Nonce"
+    assert crypto.MEMBER_SIGNATURE_HEADER == "X-NYCC-Member-Sig"
+
+
+def test_v2_did_not_fork_the_signing_domain():
+    # v2 extends the deployed v1. a new domain string would 401 every deployed node.
+    assert crypto.SIGN_DOMAIN == "nycc-grid-v1"
+    assert crypto.signing_message("h", "GET", "/v1/nodes", "1", "n").startswith(b"nycc-grid-v1|")

@@ -1,7 +1,7 @@
 // thin adapter: route parsing, webcrypto verify, kv i/o. every branch decision
 // lives in logic.js. this file ships untested, see README status.
 
-import { handleRequest, b64ToBytes, MAX_BODY_BYTES } from './logic.js';
+import { handleRequest, b64ToBytes, isApiPath, CORS_HEADERS, MAX_BODY_BYTES } from './logic.js';
 
 function kvStorage(kv) {
   return {
@@ -50,23 +50,26 @@ const webcryptoVerifier = {
   },
 };
 
-function jsonResponse(status, body) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-    },
-  });
+function jsonResponse(status, body, extra) {
+  const headers = { 'cache-control': 'no-store', ...(extra || {}) };
+  // 204 carries no body at all: a preflight answer with one is malformed.
+  if (status === 204 || body === null || body === undefined) {
+    return new Response(null, { status, headers });
+  }
+  headers['content-type'] = 'application/json; charset=utf-8';
+  return new Response(JSON.stringify(body), { status, headers });
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
+    // cors on the early exits too, or a browser reads a network error instead of a 413
+    const cors = isApiPath(url.pathname) ? CORS_HEADERS : undefined;
+
     const declared = Number(request.headers.get('content-length'));
     if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
-      return jsonResponse(413, { error: 'body too large' });
+      return jsonResponse(413, { error: 'body too large' }, cors);
     }
 
     let bodyBytes = new Uint8Array(0);
@@ -96,6 +99,10 @@ export default {
       verifier: webcryptoVerifier,
       now: () => Date.now(),
       randomUUID: () => crypto.randomUUID(),
+      // plain [vars] value. empty or unset means no club gate and open submission,
+      // which is what v1 deployed with, so shipping this file changes nothing until
+      // the key is actually set.
+      clubVerifyKey: typeof env.CLUB_VERIFY_KEY === 'string' ? env.CLUB_VERIFY_KEY : '',
     };
 
     let res;
@@ -104,8 +111,8 @@ export default {
     } catch (e) {
       // never leak internals to an unauthenticated caller.
       console.error('coordinator error', e && e.stack ? e.stack : String(e));
-      res = { status: 500, body: { error: 'internal error' } };
+      res = { status: 500, body: { error: 'internal error' }, headers: cors };
     }
-    return jsonResponse(res.status, res.body);
+    return jsonResponse(res.status, res.body, res.headers);
   },
 };

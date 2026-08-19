@@ -13,6 +13,8 @@ def _node():
         verify_key="dmVy",
         wattage=310.5,
         last_seen=1700000000.0,
+        watts_source="measured",
+        neighborhood="gowanus",
     )
 
 
@@ -57,6 +59,8 @@ def test_to_dict_keys_are_the_wire_field_names():
         "verify_key",
         "wattage",
         "last_seen",
+        "watts_source",
+        "neighborhood",
     }
     assert set(_job().to_dict()) == {
         "job_id",
@@ -83,6 +87,9 @@ def test_from_dict_coerces_numbers_and_defaults():
     )
     assert node.wattage == 250.0
     assert node.last_seen == 0.0
+    # a v1 record: it said neither, so it reads as claimed watts, place unstated
+    assert node.watts_source == "claimed"
+    assert node.neighborhood == "undisclosed"
     job = JobEnvelope.from_json(
         {"job_id": "j", "to_node": "n", "blob_b64": "", "reply_pubkey": "r"}
     )
@@ -123,6 +130,64 @@ def test_heartbeat_interval_matches_the_coordinator():
     # logic.js: HEARTBEAT_S = 30, STALE_MS = 3 * HEARTBEAT_S * 1000. node.py heartbeats
     # on this constant, so drifting it apart from the worker makes nodes read stale.
     assert protocol.HEARTBEAT_S == 30.0
+
+
+def test_watts_source_is_read_off_the_record():
+    node = NodeInfo.from_json(
+        {"node_id": "n", "pubkey": "p", "verify_key": "v", "wattage": 65.0,
+         "watts_source": "measured", "neighborhood": "bed-stuy"}
+    )
+    assert node.watts_source == "measured"
+    assert node.neighborhood == "bed-stuy"
+    assert set(protocol.WATTS_SOURCES) == {"claimed", "measured"}
+    assert protocol.DEFAULT_WATTS_SOURCE == "claimed"
+    assert protocol.DEFAULT_NEIGHBORHOOD == "undisclosed"
+
+
+def test_watts_source_is_provenance_not_proof():
+    # nothing attests either string. a node can send "measured" over a made up number,
+    # so NodeInfo takes whatever the record says instead of pretending to validate it.
+    node = NodeInfo.from_json(
+        {"node_id": "n", "pubkey": "p", "verify_key": "v", "watts_source": "vibes"}
+    )
+    assert node.watts_source == "vibes"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["gowanus", "bed-stuy", "hell's kitchen", "long island city", "undisclosed",
+     "11201", "a", "a" * 32],
+)
+def test_neighborhoods_the_coordinator_accepts(value):
+    assert protocol.valid_neighborhood(value) is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",                     # empty
+        "Gowanus",              # uppercase
+        " gowanus",             # leading space
+        "-gowanus",             # leading punctuation
+        "'gowanus",
+        "a" * 33,               # one over the cap
+        "red_hook",             # underscore is not in the class
+        "greenpoint\n",         # python's $ would let this through, \Z does not
+        "gowanus\nbrooklyn",
+        "c\u00f4te",            # non-ascii
+        "node:1",
+        None,
+        42,
+    ],
+)
+def test_neighborhoods_the_coordinator_rejects(value):
+    assert protocol.valid_neighborhood(value) is False
+
+
+def test_neighborhood_rule_is_the_coordinators_rule_verbatim():
+    # ported from logic.js. drifting them apart means a node that starts clean locally
+    # and 400s at register time.
+    assert protocol.NEIGHBORHOOD_RE.pattern == r"^[a-z0-9][a-z0-9 \-']{0,31}\Z"
 
 
 def test_no_local_liveness_rule():

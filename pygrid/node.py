@@ -3,11 +3,16 @@ seal the result back to the client's reply key.
 
 the engine has no authentication, so engine_url must be loopback: prompts travel to
 it as plaintext http.
+
+every finished job also ships a signed receipt (build_receipt), which hashes the two
+ciphertext blobs and states the watts and the wall time. the signature attributes the
+claim to this node's key; it does not make the numbers true.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -16,9 +21,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 
-from . import crypto
-from .protocol import HEARTBEAT_S, JobEnvelope
+from . import crypto, watts
+from .protocol import (
+    DEFAULT_NEIGHBORHOOD,
+    HEARTBEAT_S,
+    JobEnvelope,
+    valid_neighborhood,
+)
 
 POLL_S = 5.0
 HTTP_TIMEOUT_S = 60.0
@@ -45,6 +56,7 @@ class NodeAgent:
         verify_b64: str,
         sign_b64: str,
         wattage: float = 0.0,
+        neighborhood: str = DEFAULT_NEIGHBORHOOD,
     ) -> None:
         self.coordinator_url = coordinator_url.rstrip("/")
         self.engine_url = engine_url.rstrip("/")
@@ -53,10 +65,33 @@ class NodeAgent:
         self.box_prv_b64 = box_prv_b64
         self.verify_b64 = verify_b64
         self.sign_b64 = sign_b64
-        self.wattage = float(wattage)
+        # what the operator typed in. kept separately from self.wattage so a meter that
+        # stops answering falls back to it instead of freezing on the last reading.
+        self.claimed_wattage = float(wattage)
+        self.neighborhood = str(neighborhood or DEFAULT_NEIGHBORHOOD)
+        self.wattage = self.claimed_wattage
+        self.watts_source = "claimed"
         self.registered = False
         self._last_heartbeat = 0.0
         _warn_if_not_loopback(self.engine_url)
+        self.measure_watts()  # at startup, so the first register carries a real number
+
+    # ------------------------------------------------------------------ watts
+
+    def measure_watts(self) -> float:
+        """re-read the meter. measured wins over claimed, and watts_source says which.
+
+        called at startup and before every heartbeat, so a gpu that spins up after the
+        node started still shows up, and a driver that goes away falls back cleanly.
+        """
+        reading = watts.measure()
+        if reading is None:
+            self.wattage = self.claimed_wattage
+            self.watts_source = "claimed"
+        else:
+            self.wattage = round(float(reading), 1)
+            self.watts_source = "measured"
+        return self.wattage
 
     # ------------------------------------------------------------------ http
 
@@ -106,6 +141,8 @@ class NodeAgent:
                 "pubkey": self.box_pub_b64,
                 "verify_key": self.verify_b64,
                 "wattage": self.wattage,
+                "watts_source": self.watts_source,
+                "neighborhood": self.neighborhood,
             },
         )
         if status not in (200, 201):
@@ -116,8 +153,15 @@ class NodeAgent:
     def heartbeat(self) -> bool:
         """404 means the coordinator lost our registration; re-register instead of
         heartbeating into the void."""
+        self.measure_watts()
         status, data = self._coord(
-            "POST", "/v1/nodes/heartbeat", {"node_id": self.node_id, "wattage": self.wattage}
+            "POST",
+            "/v1/nodes/heartbeat",
+            {
+                "node_id": self.node_id,
+                "wattage": self.wattage,
+                "watts_source": self.watts_source,
+            },
         )
         self._last_heartbeat = time.monotonic()
         if status == 404:
@@ -161,17 +205,64 @@ class NodeAgent:
             raise RuntimeError("engine returned no choices")
         return choices[0].get("text", "")
 
+    def build_receipt(
+        self,
+        job_id: str,
+        started: str,
+        finished: str,
+        duration_ms: int,
+        request_raw: bytes,
+        result_raw: bytes,
+    ) -> dict:
+        """a signed statement that this node produced this exact result ciphertext.
+
+        what the signature proves: whoever holds this node's sign key saw a job blob
+        with request_sha256 and emitted a result blob with result_sha256, and stated
+        these times. the client re-hashes the blob it received, so a coordinator that
+        swapped the result cannot make the receipt check out.
+
+        what it does not prove: that the watts are real (self reported, watts_source
+        only says where the number came from), that the timings are real, or that the
+        engine ran the model it claims. it is an attributable claim, not an attestation.
+
+        both hashes are over ciphertext, so the receipt can be checked by anyone
+        without ever seeing the prompt or the answer.
+        """
+        receipt = {
+            "job_id": job_id,
+            "node_id": self.node_id,
+            "started": started,
+            "finished": finished,
+            "duration_ms": int(duration_ms),
+            "watts": float(self.wattage),
+            "watts_source": self.watts_source,
+            "request_sha256": hashlib.sha256(request_raw).hexdigest(),
+            "result_sha256": hashlib.sha256(result_raw).hexdigest(),
+        }
+        sig = crypto.sign(self.sign_b64, crypto.canonical_json(receipt))
+        return {"receipt": receipt, "sig": crypto.b64e(sig)}
+
     def process(self, env: JobEnvelope) -> None:
-        plain = crypto.unseal(
-            self.box_prv_b64, self.box_pub_b64, crypto.b64d(env.blob_b64)
-        )
+        started_at = time.monotonic()
+        started = _iso_now()
+        request_raw = crypto.b64d(env.blob_b64)
+        plain = crypto.unseal(self.box_prv_b64, self.box_pub_b64, request_raw)
         payload = json.loads(plain.decode("utf-8"))
         text = self._infer(payload)
         sealed = crypto.seal(env.reply_pubkey, json.dumps({"text": text}).encode("utf-8"))
+        finished = _iso_now()
+        duration_ms = int(round((time.monotonic() - started_at) * 1000))
+        receipt = self.build_receipt(
+            env.job_id, started, finished, duration_ms, request_raw, sealed
+        )
         status, data = self._coord(
             "POST",
             "/v1/jobs/result",
-            {"job_id": env.job_id, "blob_b64": crypto.b64e(sealed)},
+            {
+                "job_id": env.job_id,
+                "blob_b64": crypto.b64e(sealed),
+                "receipt": receipt,
+            },
         )
         if status != 200:
             raise RuntimeError("result failed: http %s %s" % (status, data))
@@ -216,6 +307,11 @@ def _warn_if_not_loopback(engine_url: str) -> None:
             "travel to it in plaintext." % engine_url,
             file=sys.stderr,
         )
+
+
+def _iso_now() -> str:
+    """utc iso8601 with a Z, which is what every receipt reader expects to parse."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _parse_json(raw: bytes) -> dict:
@@ -289,10 +385,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--engine", required=True, help="local engine base url (loopback only)")
     ap.add_argument("--keyfile", help="json keyfile; generated if absent")
     ap.add_argument("--node-id", help="node id for a freshly generated keyfile")
-    ap.add_argument("--wattage", type=float, default=0.0)
+    ap.add_argument("--wattage", type=float, default=0.0,
+                    help="watts to claim when nothing local can be measured")
+    ap.add_argument("--neighborhood", default=DEFAULT_NEIGHBORHOOD,
+                    help="lowercase, 32 chars: letters, digits, space, - and '. "
+                         "published to anyone who lists nodes, so say as little as you like")
     ap.add_argument("--interval", type=float, default=POLL_S)
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
     args = ap.parse_args(argv)
+
+    if not valid_neighborhood(args.neighborhood):
+        raise SystemExit(
+            "bad --neighborhood %r: lowercase a-z0-9, space, - and ', 1 to 32 chars"
+            % (args.neighborhood,)
+        )
 
     keys = load_keys(args.keyfile, args.node_id)
     agent = NodeAgent(
@@ -304,8 +410,10 @@ def main(argv: list[str] | None = None) -> int:
         verify_b64=keys["verify_key"],
         sign_b64=keys["signkey"],
         wattage=args.wattage,
+        neighborhood=args.neighborhood,
     )
     print("node %s -> %s (engine %s)" % (agent.node_id, agent.coordinator_url, agent.engine_url))
+    print("%.1fw %s, %s" % (agent.wattage, agent.watts_source, agent.neighborhood))
     if args.once:
         print("ran %d jobs" % agent.run_once())
         return 0

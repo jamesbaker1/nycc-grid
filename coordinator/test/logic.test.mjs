@@ -11,6 +11,9 @@ import { randomBytes } from 'node:crypto';
 import {
   handleRequest,
   buildSignedMessage,
+  canonicalJson,
+  verifyCardDocument,
+  decodeCardHeader,
   queueKey,
   PROTOCOL_PREFIX,
   MAX_SKEW_S,
@@ -21,9 +24,13 @@ import {
   MAX_BODY_BYTES,
   MAX_BLOB_B64,
   MAX_QUEUED_PER_NODE,
+  MAX_RECEIPT_BYTES,
   STALE_MS,
   NODES_LIMIT_DEFAULT,
   DONE_TTL_S,
+  CORS_HEADERS,
+  STATS_JOBS_DONE_KEY,
+  DEFAULT_NEIGHBORHOOD,
 } from '../src/logic.js';
 
 // ------------------------------------------------------------------- fixtures
@@ -41,6 +48,10 @@ const A_VERIFY_NEW = key32(0x13);
 const B_BOX = key32(0x21);
 const B_VERIFY = key32(0x22);
 const REPLY_PUB = key32(0x31);
+const CLUB_VERIFY = key32(0x41);
+const CLUB_IMPOSTOR = key32(0x42);
+const MEMBER_VERIFY = key32(0x51);
+const MEMBER_OTHER = key32(0x52);
 
 function blob(text) {
   return Buffer.from(text, 'utf8').toString('base64');
@@ -110,6 +121,8 @@ const throwingVerifier = {
   },
 };
 
+// clubVerifyKey defaults to '' so every v1 test runs against the open-submission
+// coordinator that is actually deployed today.
 function setup(opts = {}) {
   const storage = makeStorage();
   const verifier = opts.verifier || makeVerifier();
@@ -120,6 +133,7 @@ function setup(opts = {}) {
     verifier,
     now: () => clock.ms,
     randomUUID: () => `00000000-0000-4000-8000-${String(++n).padStart(12, '0')}`,
+    clubVerifyKey: opts.clubVerifyKey === undefined ? '' : opts.clubVerifyKey,
   };
   return { storage, verifier, clock, env };
 }
@@ -173,8 +187,20 @@ function signReq(env, method, path, opts = {}) {
   return makeReq(method, path, { body, headers, host });
 }
 
-async function registerNode(env, { nodeId = 'alpha', pubkey = A_BOX, verifyKey = A_VERIFY, wattage = 300 } = {}) {
+async function registerNode(
+  env,
+  {
+    nodeId = 'alpha',
+    pubkey = A_BOX,
+    verifyKey = A_VERIFY,
+    wattage = 300,
+    neighborhood = undefined,
+    wattsSource = undefined,
+  } = {},
+) {
   const body = { node_id: nodeId, pubkey, verify_key: verifyKey, wattage };
+  if (neighborhood !== undefined) body.neighborhood = neighborhood;
+  if (wattsSource !== undefined) body.watts_source = wattsSource;
   const res = await handleRequest(
     signReq(env, 'POST', '/v1/nodes/register', { body, nodeId, verifyKey }),
     env,
@@ -188,6 +214,85 @@ async function submitJob(env, { toNode = 'alpha', text = 'ciphertext', idem = nu
   if (idem) body.idempotency_key = idem;
   const res = await handleRequest(makeReq('POST', '/v1/jobs', { body }), env);
   return res;
+}
+
+// ------------------------------------------------------------- card fixtures
+
+function makeCard(over = {}) {
+  return {
+    member: 'jimmy baker',
+    member_verify_key: MEMBER_VERIFY,
+    issued: '2026-08-19T12:00:00+00:00',
+    serial: 1755600000,
+    ...over,
+  };
+}
+
+// signs the canonical bytes with the fake scheme, same as a real club key would sign
+// the bytes canonicalJson produces.
+function cardDoc(card = makeCard(), signWith = CLUB_VERIFY) {
+  // the fallback only matters for cards this canonicalizer refuses (a float serial);
+  // those are rejected on shape before any signature is checked.
+  const bytes = Buffer.from(canonicalJson(card) ?? JSON.stringify(card), 'utf8');
+  return { card, sig: fakeSig(signWith, bytes) };
+}
+
+function cardHeader(doc = cardDoc()) {
+  return Buffer.from(JSON.stringify(doc), 'utf8').toString('base64');
+}
+
+// a member-signed POST /v1/jobs. the member signature covers the same canonical string
+// as node signing, just under the member header names.
+function memberSubmit(env, opts = {}) {
+  const {
+    body = { to_node: 'alpha', blob_b64: blob('sealed'), reply_pubkey: REPLY_PUB },
+    card = makeCard(),
+    doc = null,
+    header = null,
+    signWith = MEMBER_VERIFY,
+    timestamp = null,
+    nonce = randomBytes(16).toString('base64'),
+    dropHeaders = [],
+    host = HOST,
+  } = opts;
+
+  const ts = timestamp === null ? String(Math.floor(env.now() / 1000)) : String(timestamp);
+  const msg = buildSignedMessage({
+    host,
+    method: 'POST',
+    path: '/v1/jobs',
+    timestamp: ts,
+    nonce,
+    body: bodyBytes(body),
+  });
+  const headers = {
+    'X-NYCC-Card': header === null ? cardHeader(doc || cardDoc(card)) : header,
+    'X-NYCC-Member-Ts': ts,
+    'X-NYCC-Member-Nonce': nonce,
+    'X-NYCC-Member-Sig': fakeSig(signWith, msg),
+  };
+  for (const h of dropHeaders) delete headers[h];
+  return makeReq('POST', '/v1/jobs', { body, headers, host });
+}
+
+// a job posted through the gate, for tests that need a running job to finish
+async function gatedSubmit(env, opts = {}) {
+  return handleRequest(memberSubmit(env, opts), env);
+}
+
+async function postResult(env, jobId, { text = 'sealed-result', receipt = undefined } = {}) {
+  const body = { job_id: jobId, blob_b64: blob(text) };
+  if (receipt !== undefined) body.receipt = receipt;
+  return handleRequest(signReq(env, 'POST', '/v1/jobs/result', { body }), env);
+}
+
+// register, submit, pull, post the result. returns the job id.
+async function runOneJob(env, { receipt = undefined, text = 'sealed-result' } = {}) {
+  const job = await submitJob(env);
+  await handleRequest(signReq(env, 'GET', '/v1/jobs/pull?node_id=alpha'), env);
+  const res = await postResult(env, job.body.job_id, { text, receipt });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  return job.body.job_id;
 }
 
 // --------------------------------------------------------------- canonical bytes
@@ -986,4 +1091,627 @@ test('healthz, unknown paths and wrong methods', async () => {
   assert.equal((await handleRequest(makeReq('GET', '/nope'), env)).status, 404);
   assert.equal((await handleRequest(makeReq('GET', '/v1/nodes/register'), env)).status, 405);
   assert.equal((await handleRequest(makeReq('POST', '/v1/nodes'), env)).status, 405);
+  assert.equal((await handleRequest(makeReq('POST', '/v1/stats'), env)).status, 405);
+});
+
+// ============================================================================ v2
+// neighborhood, measured watts, member cards, receipts, stats and cors.
+// ============================================================================
+
+// --------------------------------------------------------------- neighborhood
+
+test('register stores a neighborhood and the node list echoes it', async () => {
+  const { env, storage } = setup();
+  await registerNode(env, { neighborhood: "hell's kitchen" });
+  assert.equal(JSON.parse(storage.map.get('node:alpha')).neighborhood, "hell's kitchen");
+
+  const res = await handleRequest(makeReq('GET', '/v1/nodes'), env);
+  assert.equal(res.body.nodes[0].neighborhood, "hell's kitchen");
+});
+
+test('a node that names no neighborhood is filed as undisclosed', async () => {
+  const { env } = setup();
+  await registerNode(env);
+  const res = await handleRequest(makeReq('GET', '/v1/nodes'), env);
+  assert.equal(res.body.nodes[0].neighborhood, DEFAULT_NEIGHBORHOOD);
+  assert.equal(DEFAULT_NEIGHBORHOOD, 'undisclosed');
+});
+
+test('a v1 node record with no neighborhood field still lists as undisclosed', async () => {
+  const { env } = setup();
+  // exactly what v1 wrote: no neighborhood, no watts_source
+  await env.storage.put('node:legacy', {
+    node_id: 'legacy',
+    pubkey: A_BOX,
+    verify_key: A_VERIFY,
+    wattage: 42,
+    last_seen: T0,
+    registered_ms: T0,
+  });
+  const res = await handleRequest(makeReq('GET', '/v1/nodes'), env);
+  assert.equal(res.body.nodes[0].neighborhood, 'undisclosed');
+  assert.equal(res.body.nodes[0].watts_source, 'claimed');
+});
+
+test('register rejects a neighborhood that is not the pinned lowercase shape', async () => {
+  const { env, storage } = setup();
+  const bad = [
+    'Bed-Stuy', // uppercase would split one neighborhood into two pins
+    '',
+    ' leading space',
+    '-leading dash',
+    'ridgewood!',
+    'a'.repeat(33),
+    'bed\nstuy',
+    42,
+  ];
+  for (const neighborhood of bad) {
+    const body = { node_id: 'alpha', pubkey: A_BOX, verify_key: A_VERIFY, wattage: 0, neighborhood };
+    const res = await handleRequest(signReq(env, 'POST', '/v1/nodes/register', { body }), env);
+    assert.equal(res.status, 400, JSON.stringify(neighborhood));
+    assert.equal(res.body.error, 'invalid neighborhood');
+  }
+  assert.equal(storage.map.has('node:alpha'), false);
+});
+
+test('register accepts the full pinned neighborhood charset', async () => {
+  const { env } = setup();
+  for (const neighborhood of ['bed-stuy', "hell's kitchen", '5 pointz', 'a', 'a'.repeat(32)]) {
+    const body = { node_id: 'alpha', pubkey: A_BOX, verify_key: A_VERIFY, wattage: 0, neighborhood };
+    const res = await handleRequest(signReq(env, 'POST', '/v1/nodes/register', { body }), env);
+    assert.equal(res.status, 200, neighborhood);
+  }
+});
+
+// -------------------------------------------------------------- watts_source
+
+test('register stores watts_source and the node list echoes it', async () => {
+  const { env, storage } = setup();
+  await registerNode(env, { wattage: 65.4, wattsSource: 'measured' });
+  assert.equal(JSON.parse(storage.map.get('node:alpha')).watts_source, 'measured');
+  const res = await handleRequest(makeReq('GET', '/v1/nodes'), env);
+  assert.equal(res.body.nodes[0].watts_source, 'measured');
+  assert.equal(res.body.nodes[0].wattage, 65.4);
+});
+
+test('heartbeat can flip watts_source when the gpu goes away', async () => {
+  const { env, storage } = setup();
+  await registerNode(env, { wattage: 65.4, wattsSource: 'measured' });
+  const res = await handleRequest(
+    signReq(env, 'POST', '/v1/nodes/heartbeat', {
+      body: { node_id: 'alpha', wattage: 300, watts_source: 'claimed' },
+    }),
+    env,
+  );
+  assert.equal(res.status, 200);
+  const rec = JSON.parse(storage.map.get('node:alpha'));
+  assert.equal(rec.watts_source, 'claimed');
+  assert.equal(rec.wattage, 300);
+});
+
+test('watts_source outside the two known values is refused on both routes', async () => {
+  const { env } = setup();
+  const reg = await handleRequest(
+    signReq(env, 'POST', '/v1/nodes/register', {
+      body: { node_id: 'alpha', pubkey: A_BOX, verify_key: A_VERIFY, wattage: 0, watts_source: 'guessed' },
+    }),
+    env,
+  );
+  assert.equal(reg.status, 400);
+  assert.equal(reg.body.error, 'invalid watts_source');
+
+  await registerNode(env);
+  const hb = await handleRequest(
+    signReq(env, 'POST', '/v1/nodes/heartbeat', {
+      body: { node_id: 'alpha', wattage: 1, watts_source: 'vibes' },
+    }),
+    env,
+  );
+  assert.equal(hb.status, 400);
+});
+
+// ------------------------------------------------------ canonical card bytes
+
+test('canonicalJson is byte for byte python json.dumps(sort_keys, separators)', () => {
+  const card = {
+    member: 'jimmy',
+    member_verify_key: A_VERIFY,
+    issued: '2026-08-19T12:00:00+00:00',
+    serial: 1755600000,
+  };
+  assert.equal(
+    canonicalJson(card),
+    '{"issued":"2026-08-19T12:00:00+00:00","member":"jimmy",' +
+      `"member_verify_key":"${A_VERIFY}","serial":1755600000}`,
+  );
+  // key order comes from the sort, not from insertion order
+  assert.equal(canonicalJson({ b: 1, a: 2 }), '{"a":2,"b":1}');
+  assert.equal(canonicalJson({ x: -3, y: null, z: true }), '{"x":-3,"y":null,"z":true}');
+});
+
+test('canonicalJson escapes exactly what python ensure_ascii escapes', () => {
+  // every code point outside 0x20..0x7e is escaped \uXXXX, lowercase hex, del too
+  assert.equal(
+    canonicalJson({ a: 'q"b\\c\td\ne\u0001f\u007f\u2014' }),
+    '{"a":"q\\"b\\\\c\\td\\ne\\u0001f\\u007f\\u2014"}',
+  );
+  assert.equal(canonicalJson({ m: 'caf\u00e9' }), '{"m":"caf\\u00e9"}');
+  // non-bmp comes out as the surrogate pair, which is what python emits too
+  assert.equal(canonicalJson({ m: '\u{1F600}' }), '{"m":"\\ud83d\\ude00"}');
+  assert.equal(canonicalJson({ m: '' }), '{"m":""}');
+});
+
+test('canonicalJson refuses anything python would not have produced here', () => {
+  assert.equal(canonicalJson({ n: 1.5 }), null);
+  assert.equal(canonicalJson({ n: Number.NaN }), null);
+  assert.equal(canonicalJson({ n: Infinity }), null);
+  assert.equal(canonicalJson(undefined), null);
+});
+
+test('decodeCardHeader takes base64 utf8 json and nothing else', () => {
+  const doc = cardDoc();
+  assert.deepEqual(decodeCardHeader(cardHeader(doc)), doc);
+  for (const junk of ['', 'not base64!!', Buffer.from('{nope', 'utf8').toString('base64'), null, 7]) {
+    assert.equal(decodeCardHeader(junk), null, String(junk));
+  }
+});
+
+// ------------------------------------------------- card verification, in pure
+
+test('verifyCardDocument accepts a club signed card and names every failure', async () => {
+  const verifier = makeVerifier();
+  const good = await verifyCardDocument(cardDoc(), CLUB_VERIFY, verifier);
+  assert.equal(good.ok, true);
+  assert.equal(good.card.member, 'jimmy baker');
+
+  const cases = [
+    [null, 'card_malformed'],
+    ['a string', 'card_malformed'],
+    [{ card: makeCard() }, 'card_malformed'],
+    [{ card: makeCard(), sig: 'not base64!!' }, 'card_malformed'],
+    [{ card: 'nope', sig: 'AAAA' }, 'card_malformed'],
+    [cardDoc(makeCard({ member: '' })), 'card_invalid'],
+    [cardDoc(makeCard({ member: 'x'.repeat(65) })), 'card_invalid'],
+    [cardDoc(makeCard({ member: 7 })), 'card_invalid'],
+    [cardDoc(makeCard({ member_verify_key: 'short' })), 'card_invalid'],
+    [cardDoc(makeCard({ issued: 'yesterday' })), 'card_invalid'],
+    [cardDoc(makeCard({ issued: '19/08/2026' })), 'card_invalid'],
+    [cardDoc(makeCard({ issued: 7 })), 'card_invalid'],
+    [cardDoc(makeCard({ serial: 1.5 })), 'card_invalid'],
+    [cardDoc(makeCard({ serial: '1755600000' })), 'card_invalid'],
+    [cardDoc(makeCard(), CLUB_IMPOSTOR), 'card_not_signed_by_club'],
+  ];
+  for (const [doc, code] of cases) {
+    const res = await verifyCardDocument(doc, CLUB_VERIFY, verifier);
+    assert.equal(res.ok, false, JSON.stringify(doc));
+    assert.equal(res.code, code, JSON.stringify(doc));
+  }
+});
+
+test('issued is accepted as a date or as a full timestamp', async () => {
+  for (const issued of ['2026-08-19', '2026-08-19T12:00:00+00:00', '2026-08-19 12:00', '2026-08-19T12:00:00.123456Z']) {
+    const res = await verifyCardDocument(cardDoc(makeCard({ issued })), CLUB_VERIFY, makeVerifier());
+    assert.equal(res.ok, true, issued);
+  }
+});
+
+test('a card field edited after issue no longer verifies', async () => {
+  const doc = cardDoc(makeCard({ member: 'a guest' }));
+  doc.card.member = 'jimmy baker'; // promotion by text editor
+  const res = await verifyCardDocument(doc, CLUB_VERIFY, makeVerifier());
+  assert.equal(res.code, 'card_not_signed_by_club');
+});
+
+test('a field bolted onto a signed card breaks the signature', async () => {
+  const doc = cardDoc();
+  doc.card.tier = 'founder';
+  const res = await verifyCardDocument(doc, CLUB_VERIFY, makeVerifier());
+  assert.equal(res.code, 'card_not_signed_by_club');
+});
+
+test('a card the club signed with an extra field still verifies', async () => {
+  // forward compatibility: the canonical form covers every key on the card, so a v3
+  // field the club signed does not have to be known here to check out.
+  const card = makeCard({ tier: 'founder' });
+  const res = await verifyCardDocument(cardDoc(card), CLUB_VERIFY, makeVerifier());
+  assert.equal(res.ok, true);
+});
+
+test('a card verifier that throws is a failure, not an exception', async () => {
+  const res = await verifyCardDocument(cardDoc(), CLUB_VERIFY, throwingVerifier);
+  assert.equal(res.ok, false);
+  assert.equal(res.code, 'card_not_signed_by_club');
+});
+
+// ----------------------------------------------------------- the submit gate
+
+test('with no club key configured submission is open exactly as v1', async () => {
+  const { env } = setup(); // clubVerifyKey ''
+  await registerNode(env);
+  const res = await submitJob(env);
+  assert.equal(res.status, 200);
+
+  // a card sent to a coordinator that has no club key is ignored, not rejected
+  const carded = await handleRequest(memberSubmit(env), env);
+  assert.equal(carded.status, 200);
+});
+
+test('with a club key configured an uncarded submit is 403 and queues nothing', async () => {
+  const { env, storage } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  const res = await submitJob(env);
+  assert.equal(res.status, 403);
+  assert.equal(res.body.code, 'card_required');
+  assert.equal([...storage.map.keys()].some((k) => k.startsWith('job:')), false);
+  assert.equal([...storage.map.keys()].some((k) => k.startsWith('queue:')), false);
+});
+
+test('a carded and member signed submit is accepted and queued', async () => {
+  const { env, storage } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  const res = await gatedSubmit(env);
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.ok(res.body.job_id);
+  assert.equal(JSON.parse(storage.map.get(`job:${res.body.job_id}`)).status, 'queued');
+});
+
+test('the gate answers before the body is read, so probing tells an outsider nothing', async () => {
+  const { env } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  for (const body of ['not json', '[]', { to_node: 'ghost' }]) {
+    const res = await handleRequest(makeReq('POST', '/v1/jobs', { body }), env);
+    assert.equal(res.status, 403);
+    assert.equal(res.body.code, 'card_required');
+  }
+});
+
+test('every gate failure is a 403 with its own code', async () => {
+  const { env } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  const nowS = Math.floor(T0 / 1000);
+
+  const cases = [
+    ['card_malformed', { header: 'not base64!!' }],
+    ['card_invalid', { card: makeCard({ member: '' }) }],
+    ['card_not_signed_by_club', { doc: cardDoc(makeCard(), CLUB_IMPOSTOR) }],
+    ['member_sig_missing', { dropHeaders: ['X-NYCC-Member-Sig'] }],
+    ['member_sig_missing', { dropHeaders: ['X-NYCC-Member-Nonce'] }],
+    ['member_sig_missing', { dropHeaders: ['X-NYCC-Member-Ts'] }],
+    ['member_sig_expired', { timestamp: nowS - (MAX_SKEW_S + 1) }],
+    ['member_sig_expired', { timestamp: nowS + MAX_SKEW_S + 1 }],
+    ['member_sig_invalid', { signWith: MEMBER_OTHER }],
+  ];
+  for (const [code, opts] of cases) {
+    const res = await handleRequest(memberSubmit(env, opts), env);
+    assert.equal(res.status, 403, code);
+    assert.equal(res.body.code, code, JSON.stringify(opts));
+  }
+});
+
+test('a malformed member timestamp or nonce header is refused', async () => {
+  const { env } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+
+  const badTs = await handleRequest(memberSubmit(env, { timestamp: 'now-ish' }), env);
+  assert.equal(badTs.body.code, 'member_sig_malformed');
+
+  const req = memberSubmit(env);
+  req.headers['x-nycc-member-nonce'] = 'line\nbreak'; // would shift the signed framing
+  assert.equal((await handleRequest(req, env)).body.code, 'member_sig_malformed');
+
+  const badSig = memberSubmit(env);
+  badSig.headers['x-nycc-member-sig'] = 'not base64!!';
+  assert.equal((await handleRequest(badSig, env)).body.code, 'member_sig_malformed');
+});
+
+test('the member signature covers the body, so a rewritten job is refused', async () => {
+  const { env, storage } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  await registerNode(env, { nodeId: 'bravo', pubkey: B_BOX, verifyKey: B_VERIFY });
+
+  const req = memberSubmit(env);
+  // re-pointed at another member's gpu after the member signed it
+  req.bodyBytes = bodyBytes({ to_node: 'bravo', blob_b64: blob('sealed'), reply_pubkey: REPLY_PUB });
+  const res = await handleRequest(req, env);
+  assert.equal(res.status, 403);
+  assert.equal(res.body.code, 'member_sig_invalid');
+  assert.equal([...storage.map.keys()].some((k) => k.startsWith('job:')), false);
+});
+
+test('a member signature captured from another deployment does not verify here', async () => {
+  const { env } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  const req = memberSubmit(env, { host: 'other.example.com' });
+  req.host = HOST;
+  assert.equal((await handleRequest(req, env)).body.code, 'member_sig_invalid');
+});
+
+test('a replayed member nonce is refused and the nonce is stored per member key', async () => {
+  const { env, storage } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  const nonce = 'bWVtYmVyLW5vbmNlLTAwMDE=';
+
+  const first = await handleRequest(memberSubmit(env, { nonce }), env);
+  assert.equal(first.status, 200);
+  assert.equal(storage.ttls.get(`mnonce:${MEMBER_VERIFY}:${nonce}`), NONCE_TTL_S);
+
+  const replay = await handleRequest(memberSubmit(env, { nonce }), env);
+  assert.equal(replay.status, 403);
+  assert.equal(replay.body.code, 'member_sig_replay');
+
+  // the same nonce under a different member key is a different nonce
+  const other = makeCard({ member: 'someone else', member_verify_key: MEMBER_OTHER });
+  const shared = await handleRequest(
+    memberSubmit(env, { card: other, signWith: MEMBER_OTHER, nonce }),
+    env,
+  );
+  assert.equal(shared.status, 200);
+});
+
+test('a forged member signature cannot burn a members nonce space', async () => {
+  const { env, storage } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  const nonce = 'YnVybi1tZW1iZXItbm9uYw==';
+
+  const forged = await handleRequest(memberSubmit(env, { nonce, signWith: MEMBER_OTHER }), env);
+  assert.equal(forged.status, 403);
+  assert.equal(storage.map.has(`mnonce:${MEMBER_VERIFY}:${nonce}`), false);
+
+  const real = await handleRequest(memberSubmit(env, { nonce }), env);
+  assert.equal(real.status, 200);
+});
+
+test('the gate does not change any other route', async () => {
+  const { env } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env); // signed by the node key, no card anywhere
+  assert.equal((await handleRequest(makeReq('GET', '/v1/nodes'), env)).status, 200);
+  assert.equal((await handleRequest(makeReq('GET', '/v1/stats'), env)).status, 200);
+  assert.equal(
+    (await handleRequest(signReq(env, 'GET', '/v1/jobs/pull?node_id=alpha'), env)).status,
+    200,
+  );
+});
+
+test('an oversize body is 413 before the gate does any crypto', async () => {
+  const { env, verifier } = setup({ clubVerifyKey: CLUB_VERIFY });
+  await registerNode(env);
+  const before = verifier.calls.length;
+  const res = await handleRequest(
+    makeReq('POST', '/v1/jobs', { body: 'x'.repeat(MAX_BODY_BYTES + 1) }),
+    env,
+  );
+  assert.equal(res.status, 413);
+  assert.equal(verifier.calls.length, before);
+});
+
+// ---------------------------------------------------------------- receipts
+
+test('a result receipt is stored and handed back with the finished job', async () => {
+  const { env, storage } = setup();
+  await registerNode(env);
+  const receipt = {
+    receipt: {
+      job_id: 'j1',
+      node_id: 'alpha',
+      duration_ms: 812,
+      watts: 65.0,
+      watts_source: 'measured',
+      request_sha256: 'aa'.repeat(32),
+      result_sha256: 'bb'.repeat(32),
+    },
+    sig: 'c2ln',
+  };
+  const jobId = await runOneJob(env, { receipt });
+
+  assert.deepEqual(JSON.parse(storage.map.get(`job:${jobId}`)).receipt, receipt);
+  const status = await handleRequest(makeReq('GET', `/v1/jobs/${jobId}`), env);
+  assert.equal(status.body.status, 'done');
+  assert.equal(status.body.blob_b64, blob('sealed-result'));
+  // opaque: stored and returned untouched, the coordinator verifies nothing in it
+  assert.deepEqual(status.body.receipt, receipt);
+});
+
+test('a v1 result with no receipt is still accepted and carries no receipt key', async () => {
+  const { env } = setup();
+  await registerNode(env);
+  const jobId = await runOneJob(env);
+  const status = await handleRequest(makeReq('GET', `/v1/jobs/${jobId}`), env);
+  assert.deepEqual(status.body, { status: 'done', blob_b64: blob('sealed-result') });
+});
+
+test('a receipt that is not a json object is refused, an oversize one is 413', async () => {
+  const { env, storage } = setup();
+  await registerNode(env);
+
+  for (const receipt of ['a string', [1, 2], 7]) {
+    const job = await submitJob(env);
+    await handleRequest(signReq(env, 'GET', '/v1/jobs/pull?node_id=alpha'), env);
+    const res = await postResult(env, job.body.job_id, { receipt });
+    assert.equal(res.status, 400, JSON.stringify(receipt));
+    assert.equal(JSON.parse(storage.map.get(`job:${job.body.job_id}`)).status, 'running');
+  }
+
+  const job = await submitJob(env);
+  await handleRequest(signReq(env, 'GET', '/v1/jobs/pull?node_id=alpha'), env);
+  const big = await postResult(env, job.body.job_id, {
+    receipt: { pad: 'x'.repeat(MAX_RECEIPT_BYTES + 1) },
+  });
+  assert.equal(big.status, 413);
+});
+
+test('a retried result never replaces the first receipt', async () => {
+  const { env, storage } = setup();
+  await registerNode(env);
+  const job = await submitJob(env);
+  const jobId = job.body.job_id;
+  await handleRequest(signReq(env, 'GET', '/v1/jobs/pull?node_id=alpha'), env);
+
+  await postResult(env, jobId, { text: 'first', receipt: { n: 1 } });
+  const retry = await postResult(env, jobId, { text: 'second', receipt: { n: 2 } });
+  assert.equal(retry.body.duplicate, true);
+  assert.deepEqual(JSON.parse(storage.map.get(`job:${jobId}`)).receipt, { n: 1 });
+});
+
+// ------------------------------------------------------------------- stats
+
+test('stats on an empty grid is all zeros', async () => {
+  const { env } = setup();
+  const res = await handleRequest(makeReq('GET', '/v1/stats'), env);
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body, {
+    ok: true,
+    nodes_alive: 0,
+    watts: 0,
+    watts_measured: 0,
+    jobs_done: 0,
+    neighborhoods: [],
+  });
+});
+
+test('stats sums alive nodes only and splits measured from claimed', async () => {
+  const { env } = setup();
+  await registerNode(env, { nodeId: 'a1', wattage: 65.1, wattsSource: 'measured', neighborhood: 'bed-stuy' });
+  await registerNode(env, {
+    nodeId: 'a2',
+    pubkey: B_BOX,
+    verifyKey: B_VERIFY,
+    wattage: 30.2,
+    wattsSource: 'claimed',
+    neighborhood: 'bed-stuy',
+  });
+  await registerNode(env, { nodeId: 'a3', wattage: 10, wattsSource: 'measured', neighborhood: 'ridgewood' });
+  // a4 went quiet three heartbeats ago: it must drop out of every total, including
+  // its neighborhood, so the map shows watts that are actually plugged in
+  await env.storage.put('node:a4', {
+    node_id: 'a4',
+    pubkey: A_BOX,
+    verify_key: A_VERIFY,
+    wattage: 1000,
+    watts_source: 'measured',
+    neighborhood: 'ridgewood',
+    last_seen: T0 - STALE_MS - 1,
+    registered_ms: T0,
+  });
+
+  const res = await handleRequest(makeReq('GET', '/v1/stats'), env);
+  assert.equal(res.body.nodes_alive, 3);
+  assert.equal(res.body.watts, 105.3);
+  assert.equal(res.body.watts_measured, 75.1);
+  assert.deepEqual(res.body.neighborhoods, [
+    { name: 'bed-stuy', nodes: 2, watts: 95.3 },
+    { name: 'ridgewood', nodes: 1, watts: 10 },
+  ]);
+});
+
+test('stats files nodes with no neighborhood under undisclosed', async () => {
+  const { env } = setup();
+  await registerNode(env, { nodeId: 'a1', wattage: 5 });
+  const res = await handleRequest(makeReq('GET', '/v1/stats'), env);
+  assert.deepEqual(res.body.neighborhoods, [{ name: 'undisclosed', nodes: 1, watts: 5 }]);
+});
+
+test('jobs_done counts accepted results once each', async () => {
+  const { env, storage } = setup();
+  await registerNode(env);
+
+  const first = await runOneJob(env);
+  assert.equal((await handleRequest(makeReq('GET', '/v1/stats'), env)).body.jobs_done, 1);
+
+  await runOneJob(env);
+  assert.equal(storage.map.get(STATS_JOBS_DONE_KEY), '2');
+
+  // a retry of an already accepted result must not count twice
+  await postResult(env, first, { text: 'again' });
+  assert.equal((await handleRequest(makeReq('GET', '/v1/stats'), env)).body.jobs_done, 2);
+
+  // a refused result does not count either
+  await submitJob(env);
+  assert.equal((await handleRequest(makeReq('GET', '/v1/stats'), env)).body.jobs_done, 2);
+});
+
+test('a junk counter value reads as zero rather than breaking stats', async () => {
+  const { env } = setup();
+  await env.storage.put(STATS_JOBS_DONE_KEY, 'seventeen');
+  const res = await handleRequest(makeReq('GET', '/v1/stats'), env);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.jobs_done, 0);
+});
+
+test('stats pages through every node record, not just the first page', async () => {
+  const { env, storage } = setup();
+  for (let i = 0; i < 12; i++) {
+    await storage.put(`node:n${String(i).padStart(3, '0')}`, {
+      node_id: `n${i}`,
+      pubkey: A_BOX,
+      verify_key: A_VERIFY,
+      wattage: 1,
+      watts_source: 'claimed',
+      neighborhood: 'bed-stuy',
+      last_seen: T0,
+      registered_ms: T0,
+    });
+  }
+  const listSpy = storage.list.bind(storage);
+  let pages = 0;
+  storage.list = async (opts) => {
+    pages += 1;
+    // a kv page smaller than the namespace, which is what the cursor loop is for
+    return listSpy({ ...opts, limit: 5 });
+  };
+  const res = await handleRequest(makeReq('GET', '/v1/stats'), env);
+  assert.equal(res.body.nodes_alive, 12);
+  assert.ok(pages > 1, 'expected the cursor loop to run');
+});
+
+// -------------------------------------------------------------------- cors
+
+test('every v1 response carries the cors headers, including errors', async () => {
+  const { env } = setup();
+  const responses = [
+    await handleRequest(makeReq('GET', '/v1/nodes'), env),
+    await handleRequest(makeReq('GET', '/v1/stats'), env),
+    await handleRequest(makeReq('GET', '/v1/jobs/nope'), env),
+    await handleRequest(makeReq('POST', '/v1/nodes'), env),
+    await handleRequest(makeReq('GET', '/v1/does-not-exist'), env),
+  ];
+  for (const res of responses) {
+    assert.equal(res.headers['access-control-allow-origin'], '*');
+    assert.equal(res.headers['access-control-allow-methods'], 'GET, POST, OPTIONS');
+    assert.equal(res.headers['access-control-max-age'], '86400');
+  }
+});
+
+test('allow-headers names content-type and every x-nycc header in use', () => {
+  const allowed = CORS_HEADERS['access-control-allow-headers'].split(',').map((s) => s.trim());
+  assert.deepEqual(allowed.slice(0, 1), ['content-type']);
+  for (const h of [
+    'x-nycc-node-id',
+    'x-nycc-timestamp',
+    'x-nycc-nonce',
+    'x-nycc-signature',
+    'x-nycc-card',
+    'x-nycc-member-ts',
+    'x-nycc-member-nonce',
+    'x-nycc-member-sig',
+  ]) {
+    assert.ok(allowed.includes(h), h);
+  }
+});
+
+test('preflight anywhere under /v1/ is 204 with the headers and no body', async () => {
+  const { env } = setup();
+  for (const p of ['/v1/jobs', '/v1/nodes/register', '/v1/stats', '/v1/whatever']) {
+    const res = await handleRequest(makeReq('OPTIONS', p), env);
+    assert.equal(res.status, 204, p);
+    assert.equal(res.body, null);
+    assert.equal(res.headers['access-control-allow-origin'], '*');
+  }
+});
+
+test('routes outside /v1/ get no cors headers', async () => {
+  const { env } = setup();
+  assert.equal((await handleRequest(makeReq('GET', '/healthz'), env)).headers, undefined);
+  assert.equal((await handleRequest(makeReq('GET', '/nope'), env)).headers, undefined);
+  // preflight is a /v1/ affair; /healthz keeps the v1 405 for a method it does not have
+  assert.equal((await handleRequest(makeReq('OPTIONS', '/healthz'), env)).status, 405);
 });

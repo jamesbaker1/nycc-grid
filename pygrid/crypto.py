@@ -7,8 +7,10 @@ learns nothing about the sender, and there is no sender authentication.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import time
+from typing import Any
 from urllib.parse import urlsplit
 
 from nacl.public import PrivateKey, PublicKey, SealedBox
@@ -17,6 +19,9 @@ from nacl.signing import SigningKey, VerifyKey
 # every signed request is bound to this domain string plus the coordinator host, so a
 # signature captured from one deployment cannot be replayed against another deployment
 # that shares node keys.
+#
+# v2 keeps the v1 domain on purpose. the canonical string did not change: member
+# signatures reuse it byte for byte and differ only in which headers carry the result.
 SIGN_DOMAIN = "nycc-grid-v1"
 
 NONCE_BYTES = 16
@@ -26,10 +31,32 @@ MAX_SKEW_S = 300
 KEY_BYTES = 32
 SIG_BYTES = 64
 
+# node request signature, v1.
+NODE_ID_HEADER = "X-NYCC-Node-Id"
+TIMESTAMP_HEADER = "X-NYCC-Timestamp"
+NONCE_HEADER = "X-NYCC-Nonce"
+SIGNATURE_HEADER = "X-NYCC-Signature"
+
+# member (club card) request signature, v2. a different set of header names over the
+# SAME canonical string, so a node signature and a member signature can ride on one
+# request without either one shadowing the other.
+CARD_HEADER = "X-NYCC-Card"
+MEMBER_TIMESTAMP_HEADER = "X-NYCC-Member-Ts"
+MEMBER_NONCE_HEADER = "X-NYCC-Member-Nonce"
+MEMBER_SIGNATURE_HEADER = "X-NYCC-Member-Sig"
+
 __all__ = [
     "SIGN_DOMAIN",
     "NONCE_BYTES",
     "MAX_SKEW_S",
+    "NODE_ID_HEADER",
+    "TIMESTAMP_HEADER",
+    "NONCE_HEADER",
+    "SIGNATURE_HEADER",
+    "CARD_HEADER",
+    "MEMBER_TIMESTAMP_HEADER",
+    "MEMBER_NONCE_HEADER",
+    "MEMBER_SIGNATURE_HEADER",
     "keygen",
     "seal",
     "unseal",
@@ -37,8 +64,10 @@ __all__ = [
     "sign",
     "verify",
     "new_nonce",
+    "canonical_json",
     "signing_message",
     "signed_headers",
+    "member_signed_headers",
     "split_target",
     "b64e",
     "b64d",
@@ -123,6 +152,20 @@ def new_nonce() -> str:
     return _b64e(os.urandom(NONCE_BYTES))
 
 
+def canonical_json(doc: Any) -> bytes:
+    """the one byte string a signed json document is signed over.
+
+    sorted keys, no whitespace, utf-8. used by member cards (pygrid.club) and job
+    receipts (pygrid.node), so a verifier that can rebuild the dict can rebuild the
+    signed bytes without keeping the original serialization around.
+
+    this is for documents that are re-serialized by whoever verifies them. request
+    bodies are never canonicalized: those sign the raw bytes on the wire, see
+    signing_message().
+    """
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
 def signing_message(
     host: str,
     method: str,
@@ -161,6 +204,27 @@ def split_target(url: str) -> tuple[str, str]:
     return host, path
 
 
+def _request_signature(
+    sign_b64: str,
+    url: str,
+    method: str,
+    body: bytes = b"",
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> tuple[str, str, str]:
+    """(timestamp, nonce, signature_b64) over the canonical string for url.
+
+    the single place a request signature is produced. node signing and member signing
+    both come through here, so there is one canonicalization in the grid and adding a
+    third signer cannot quietly invent a second one.
+    """
+    host, path = split_target(url)
+    ts = str(int(time.time()) if timestamp is None else int(timestamp))
+    nce = new_nonce() if nonce is None else nonce
+    msg = signing_message(host, method, path, ts, nce, body)
+    return ts, nce, _b64e(sign(sign_b64, msg))
+
+
 def signed_headers(
     node_id: str,
     sign_b64: str,
@@ -170,14 +234,34 @@ def signed_headers(
     timestamp: int | None = None,
     nonce: str | None = None,
 ) -> dict[str, str]:
-    """the four X-NYCC-* headers for a signed request to url."""
-    host, path = split_target(url)
-    ts = str(int(time.time()) if timestamp is None else int(timestamp))
-    nce = new_nonce() if nonce is None else nonce
-    msg = signing_message(host, method, path, ts, nce, body)
+    """the four X-NYCC-* headers for a node-signed request to url."""
+    ts, nce, sig = _request_signature(sign_b64, url, method, body, timestamp, nonce)
     return {
-        "X-NYCC-Node-Id": node_id,
-        "X-NYCC-Timestamp": ts,
-        "X-NYCC-Nonce": nce,
-        "X-NYCC-Signature": _b64e(sign(sign_b64, msg)),
+        NODE_ID_HEADER: node_id,
+        TIMESTAMP_HEADER: ts,
+        NONCE_HEADER: nce,
+        SIGNATURE_HEADER: sig,
+    }
+
+
+def member_signed_headers(
+    sign_b64: str,
+    url: str,
+    method: str,
+    body: bytes = b"",
+    timestamp: int | None = None,
+    nonce: str | None = None,
+) -> dict[str, str]:
+    """the three X-NYCC-Member-* headers for a card-holding client.
+
+    identical bytes to signed_headers() for the same key, url, body, timestamp and
+    nonce: only the header names differ. the member identity is not in the signed
+    string, it comes from the card in X-NYCC-Card, whose member_verify_key is the key
+    the coordinator checks this signature against.
+    """
+    ts, nce, sig = _request_signature(sign_b64, url, method, body, timestamp, nonce)
+    return {
+        MEMBER_TIMESTAMP_HEADER: ts,
+        MEMBER_NONCE_HEADER: nce,
+        MEMBER_SIGNATURE_HEADER: sig,
     }
