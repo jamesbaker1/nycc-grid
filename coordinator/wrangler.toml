@@ -19,7 +19,7 @@ routes = [
 # deploy`, so the next deploy from a clean checkout would overwrite the gate with the
 # empty default below and reopen submission to anyone, silently and with no error.
 [vars]
-CLUB_VERIFY_KEY = ""
+CLUB_VERIFY_KEY = "eRyGiCl059ik5/9WBToOhKhE9oIxmTLvCgO7AnAi6T0="
 
 # zero npm deps. src/logic.js is plain esm and is the only thing under test.
 #
