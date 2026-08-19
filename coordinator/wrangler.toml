@@ -1,14 +1,17 @@
 name = "nycc-grid-coordinator"
 main = "src/worker.js"
 compatibility_date = "2026-08-19"
+workers_dev = true
+
+routes = [
+  { pattern = "grid.newyorkcomputeclub.com", custom_domain = true },
+]
 
 # zero npm deps. src/logic.js is plain esm and is the only thing under test.
-# deploy has NOT been run: the ids below are placeholders, replace them with the
-# output of `wrangler kv namespace create GRID` before the first deploy.
 [[kv_namespaces]]
 binding = "GRID"
-id = "replace-with-grid-kv-namespace-id"
-preview_id = "replace-with-grid-preview-kv-namespace-id"
+id = "f62544982bf242ff8e4580414b9b9669"
+preview_id = "f62544982bf242ff8e4580414b9b9669"
 
 [observability]
 enabled = true

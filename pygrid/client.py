@@ -63,7 +63,9 @@ class GridClient:
     def _call(self, method: str, path: str, payload: dict | None = None) -> dict:
         url = self.coordinator_url + path
         data = None
-        headers = {"Accept": "application/json"}
+        # a real product UA: urllib's default is on every bot-signature blocklist,
+        # including the one in front of our own coordinator.
+        headers = {"Accept": "application/json", "User-Agent": "nycc-client/0.1"}
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"

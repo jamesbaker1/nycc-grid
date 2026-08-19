@@ -68,7 +68,9 @@ class NodeAgent:
         signed: bool = False,
         timeout: float = HTTP_TIMEOUT_S,
     ) -> tuple[int, dict]:
-        headers = {"Accept": "application/json"}
+        # a real product UA: urllib's default is on every bot-signature blocklist,
+        # including the one in front of our own coordinator.
+        headers = {"Accept": "application/json", "User-Agent": "nycc-node/0.1"}
         if body:
             headers["Content-Type"] = "application/json"
         if signed:
