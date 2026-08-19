@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nycc-grid"
+version = "0.1.0"
+description = "encrypted job mesh for the new york compute club: coordinator client, node agent, sealed job envelopes"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "new york compute club" }]
+keywords = ["nycc", "grid", "libsodium", "sealed-box", "inference"]
+
+# pynacl is the only runtime dependency. all http goes through stdlib urllib.request:
+# requests is deliberately absent so a node has one binary dependency, not twenty.
+dependencies = ["pynacl>=1.5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://newyorkcomputeclub.com"
+
+[project.scripts]
+nycc-node = "pygrid.node:main"
+nycc-client = "pygrid.client:main"
+
+[tool.setuptools]
+# explicit: auto-discovery would try to package coordinator/ (javascript) and tests/.
+packages = ["pygrid"]
+
+# no [tool.pytest.ini_options] here on purpose. tests are run from the repo root as
+# `.venv/Scripts/python.exe -m pytest tests/test_<name>.py`, which puts cwd on sys.path
+# and makes `import pygrid` work with no install step. adding collection config here
+# would silently change how every other test file in the repo is gathered.

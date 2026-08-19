@@ -1,0 +1,35 @@
+# secrets first. these hold unencrypted private keys, see docs/THREAT_MODEL.md.
+*.keys.json
+node-keys.json
+keys/
+*.job.json
+.dev.vars
+.env
+.env.*
+
+# python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# cloudflare worker tooling. wrangler.toml itself is tracked; its state is not.
+node_modules/
+.wrangler/
+coordinator/.wrangler/
+coordinator/node_modules/
+
+# editors and os junk
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
