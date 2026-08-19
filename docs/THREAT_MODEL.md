@@ -1,10 +1,10 @@
 # threat model
 
-what nycc-grid v1 actually protects, and what it does not. read the second half before
+what nycc-grid actually protects, and what it does not. read the second half before
 you send anything you would mind a stranger reading.
 
-this document describes the code in this repo today. where something is aspirational it
-says v2, and v2 means not built.
+this document describes the code in this repo today, protocol v2 included. where
+something is designed but not built it says so, and says where the design lives.
 
 ## what is actually implemented
 
@@ -24,6 +24,13 @@ says v2, and v2 means not built.
   control on `GET /v1/jobs/<job_id>`.
 - results are accepted only from the node the job was routed to, only while that job is in
   `running`, and only once. status transitions are monotonic: `queued -> running -> done|failed`.
+- a finished job can carry a receipt the node signed with its ed25519 key: job id, node id,
+  start and finish times, watts, and the sha256 of both the job and the result ciphertext.
+  the client checks that signature and re-hashes the blob it decrypted. see section 2 for
+  what that is worth and what it is not.
+- `POST /v1/jobs` can be gated on a club-signed membership card plus a member signature over
+  the same canonical string node requests use. it is gated only when the coordinator has a
+  club verify key configured, and it ships without one. see section 3.
 
 that is the whole list. everything below is a gap.
 
@@ -42,30 +49,54 @@ fingerprint from the operator over a channel the coordinator does not control, t
 `--to-node` and check the key yourself. pinning is not implemented and the client does not
 warn you when a node's advertised key changes.
 
-## 2. results have no sender authentication
+## 2. results are signed, but the key they are checked against comes from the coordinator
 
-`crypto_box_seal` is anonymous by construction. the sealed box carries an ephemeral sender
-key generated at seal time, and the recipient learns nothing about who sealed it. it proves
-nobody tampered with the ciphertext. it does not prove who produced it.
+the sealing layer authenticates nobody. `crypto_box_seal` is anonymous by construction: the
+sealed box carries an ephemeral sender key generated at seal time, so it proves nobody
+tampered with the ciphertext and nothing about who produced it. the reply pubkey travels in
+every job envelope, so the coordinator sees it and so does the node, and either could seal
+an arbitrary payload to that key and post it as the result.
 
-the reply pubkey travels in every job envelope, so the coordinator sees it, and so does the
-node. either can seal an arbitrary payload to that key and post it as the result. the client
-will unseal it happily and print it. a substituted or forged completion is indistinguishable
-from a real one.
+receipts sit on top of that. a node posts one alongside the result, signed with its ed25519
+key over `crypto.canonical_json` of the receipt, and `GridClient.result_with_receipt()`
+hands back `(text, receipt, verified)`. `verified` is true only when the signature checks
+out, the receipt names this job id, and `result_sha256` matches the blob this client
+actually decrypted. a coordinator that swapped the result cannot make that check pass.
 
-signing results with the node's ed25519 key would fix this. it is not implemented.
+three caveats, all load bearing:
 
-## 3. job submission and first registration are unauthenticated
+- the verify key comes from `GET /v1/nodes`, which the coordinator serves. this catches a
+  coordinator that swapped a result. it does not catch a coordinator that lies about the
+  result and the key together, which is section 1 again. pin the node's verify key out of
+  band if that matters; the client does not pin it and does not warn when it changes.
+- plain `result()` ignores the receipt and returns the text either way. only
+  `result_with_receipt()` and `verify_receipt()` produce the boolean, and the cli prints
+  `receipt: FAILED VERIFICATION` and still exits 0. the property exists for code that reads
+  the boolean, and for nobody else.
+- a node that posts no receipt at all is not an error: `verified` is false, and the text
+  comes back regardless.
 
-`POST /v1/jobs` has no authentication at all. anyone who can reach the coordinator can queue
-work onto members' gpus, up to the per node cap of 100 queued jobs and the 1 MiB blob cap.
-there is no client identity, no api key, no quota, and no accounting: the only backpressure
-is the queue cap and the 429 it returns.
+what a verified receipt says is that this node's key stands behind this exact result
+ciphertext. it does not make the watts or the timings in it true, and it is not an
+attestation that the engine ran what it claims. section 5 still applies to the numbers.
 
-`POST /v1/nodes/register` for a new node_id is equally open. the signature proves possession
-of the key in the body, not membership of the club. anyone can register any number of sybil
-nodes, advertise attractive wattage, and collect auto-picked jobs from every client on the
-grid.
+## 3. job submission is open unless the club key is set, and first registration is open either way
+
+`POST /v1/jobs` is card-gated only when the coordinator has `CLUB_VERIFY_KEY` configured.
+it ships empty and the deployed coordinator runs that way, so submission is open today:
+anyone who can reach it can queue work onto members' gpus, up to the per node cap of 100
+queued jobs and the 1 MiB blob cap.
+
+set the key and every submit needs a card the club signed plus a member signature, and an
+uncarded submit is a 403. what that buys is narrow. cards have no expiry and no revocation,
+so one is good until the club rotates its key, which invalidates every member's card at
+once. there is still no quota and no accounting: the queue cap and its 429 remain the only
+backpressure. and it gates submission only.
+
+`POST /v1/nodes/register` for a new node_id is open with or without a club key. the
+signature proves possession of the key in the body, not membership of the club. anyone can
+register any number of sybil nodes, advertise attractive wattage, and collect auto-picked
+jobs from every client on the grid.
 
 ## 4. sealed job blobs carry no replay binding
 
@@ -83,7 +114,10 @@ the sealed payload, which is a different layer.
 ## 5. wattage is self reported, and auto-pick trusts it
 
 `GridClient.submit()` with no `to_node` picks the alive node advertising the lowest wattage.
-wattage is a number the node types into its own heartbeat. nothing measures it.
+wattage is a number the node sends in its own heartbeat. v2 added a `watts_source` label
+beside it: a node that read `nvidia-smi power.draw` says `measured`, one that did not says
+`claimed`. the number and the label are both whatever the node sends, and nothing on the
+receiving end can check either one.
 
 a malicious node advertises 0 watts and attracts every auto-picked job on the grid. "clients
 choose nodes they trust" is only true when you pass `to_node` explicitly. the auto-pick is a
@@ -146,9 +180,11 @@ prompt to run inference on it. sealed boxes protect the job from the coordinator
 the network. they protect nothing from the machine doing the work.
 
 TEE attestation, where a node proves it is running an unmodified engine inside an enclave and
-the client seals to an attested key rather than a self declared one, is v2. it is not
-started. there is no enclave, no measurement, no attestation document, and no verification
-path anywhere in this repo.
+the client seals to an attested key rather than a self declared one, is not started. there is
+no enclave, no measurement, no attestation implementation, and no verification path anywhere
+in this repo. what does exist is the design: [ATTESTATION.md](ATTESTATION.md) works through
+the candidate mechanisms, what each one does and does not cover, and the phased plan for
+where it would plug in. it is a document, not a defense, and it says so itself.
 
 until that exists, the trust model is social: send jobs to members you know, and assume
 anything you send is readable by whoever runs that box.
@@ -164,12 +200,23 @@ anything you send is readable by whoever runs that box.
 | any other registered node | no | no | the public /v1/nodes view |
 | whoever holds the reply pubkey | can forge a result | can forge a result | yes |
 
-## v2 candidates, none started
+a forged result now leaves a mark: whoever forged it cannot sign a receipt with the node's
+key, so `result_with_receipt()` reports `verified=False`. the two exceptions are the node
+itself, which really does hold that key, and a coordinator that swaps the verify key along
+with the result, per section 2. plain `result()` returns the forgery as text either way, and
+the cli still exits 0, so this only helps a caller that reads the boolean.
 
-- TEE attestation and sealing to an attested key
-- signed results, so a completion proves which node produced it
-- membership authentication on `POST /v1/jobs`, with per client quota and accounting
+## still missing
+
+- TEE attestation and sealing to an attested key. designed in
+  [ATTESTATION.md](ATTESTATION.md), not started, and the most expensive item here.
 - key fingerprint pinning in the client, with a loud warning on change
 - replay binding inside the sealed payload (job_id plus freshness value)
 - encrypted key storage with a passphrase or an OS keychain
-- measured wattage instead of self reported wattage
+- quota, accounting, card expiry and card revocation on top of the membership gate
+- anything that makes a node's wattage or timing claims checkable by the party reading them
+
+protocol v2 took three items off this list: signed results (section 2), membership
+authentication on `POST /v1/jobs` (section 3), and measured wattage (section 5). none of
+the three is verified by anyone but the party making the claim, which is why they moved
+sections rather than disappearing.

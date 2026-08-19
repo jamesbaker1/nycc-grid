@@ -221,6 +221,20 @@ def test_canonical_json_signature_survives_a_json_roundtrip():
     ) is True
 
 
+def test_canonical_json_writes_an_integral_float_as_an_int():
+    """javascript has one number type, so JSON.stringify(65.0) is "65". the coordinator
+    re-serializes every document it forwards, so the two languages have to agree on these
+    bytes or a receipt with integral watts stops verifying in production."""
+    assert crypto.canonical_json({"watts": 65.0}) == crypto.canonical_json({"watts": 65})
+    assert crypto.canonical_json({"watts": 65.0}) == b'{"watts":65}'
+    # nested, because a card or a receipt is not always flat
+    assert crypto.canonical_json({"a": [1.0, {"b": -2.0}]}) == b'{"a":[1,{"b":-2}]}'
+    # a fraction is left alone: round(x, 1) prints the same shortest repr on both sides
+    assert crypto.canonical_json({"watts": 65.4}) == b'{"watts":65.4}'
+    # bool is an int subclass, not a float, and must stay true rather than become 1
+    assert crypto.canonical_json({"ok": True}) == b'{"ok":true}'
+
+
 def test_canonical_json_signature_breaks_on_any_edit():
     verify_b64, sign_b64 = crypto.sign_keygen()
     receipt = {"job_id": "j1", "watts": 65.0, "duration_ms": 812}

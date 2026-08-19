@@ -456,7 +456,23 @@ def _cmd_issue(args: argparse.Namespace) -> int:
 
     member_keys = None
     member_verify = args.member_key
+    side = None
     if args.member_keygen:
+        # the keyfile name is fixed, so a second issue into the same directory would
+        # overwrite the previous member's only copy of their signing key, and that key is
+        # the card: without it the card they are holding cannot sign anything. refused for
+        # the same reason init_club_keys refuses to regenerate a club key, and refused
+        # here, before anything is written, so a rejected issue leaves no half-made card.
+        side = os.path.join(os.path.dirname(os.path.abspath(args.out)), "member.keys.json")
+        if os.path.exists(side):
+            print(
+                "%s already exists and holds a member's signing key. overwriting it "
+                "destroys that member's card, and there is no way to recover the key. "
+                "move the old keyfile somewhere safe, or issue this card into another "
+                "--out directory" % side,
+                file=sys.stderr,
+            )
+            return 1
         member_keys = make_member_keys(args.member)
         member_verify = member_keys["verify_key"]
 
@@ -465,7 +481,6 @@ def _cmd_issue(args: argparse.Namespace) -> int:
     print("wrote %s" % args.out)
 
     if member_keys is not None:
-        side = os.path.join(os.path.dirname(os.path.abspath(args.out)), "member.keys.json")
         _write_json(side, member_keys)
         print("wrote %s (unencrypted member signing key: it is the card)" % side)
 

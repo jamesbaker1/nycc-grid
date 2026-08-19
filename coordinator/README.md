@@ -34,7 +34,7 @@ node --test coordinator/test/logic.test.mjs
 ```
 
 node 22+ (module syntax detection loads `src/logic.js` as esm without a package.json).
-98 tests, no dependencies, under a second.
+102 tests, no dependencies, under a second.
 
 ## api
 
@@ -256,8 +256,14 @@ it cannot be used to stuff a job record.
 every number covers alive nodes only, by the same three-missed-heartbeats rule as the
 `alive` flag. `watts_measured` is the part of `watts` that came from nodes reporting
 `measured`. sums are rounded to one decimal, which is the precision nodes report anyway.
-the node scan pages through kv with a cursor and stops after 20 pages, so a namespace
-that somehow grows past 20k node records reports a partial total rather than hanging.
+
+the node scan is the expensive part of this route: one kv list per page plus one kv get
+per node record, and the staleness filter can only run after the get. a worker invocation
+is capped at 1000 kv operations, so the scan stops at 800 gets or 20 pages, whichever
+comes first, and adds `"partial": true` to the response when it stopped early. the totals
+are then a floor rather than the whole grid, which is the answer a namespace that has
+outgrown one invocation can actually give. node records also carry a 7 day ttl, so one-off
+registrations stop accumulating against that budget forever.
 
 `jobs_done` is a single kv integer at `__stats__:jobs_done`, incremented when a result
 is accepted. it is read-modify-write with no compare-and-swap under it, so two results
@@ -285,13 +291,21 @@ reads: `/v1/nodes`, `/v1/stats`, and `/v1/jobs/<job_id>` for a job id it knows.
 cors lives in `logic.js` so it is under test; `worker.js` only copies the headers onto
 the Response.
 
+`worker.js` sends `Cache-Control: no-store` by default. the two public reads override it:
+`GET /v1/nodes` and `GET /v1/stats` answer `Cache-Control: public, max-age=15`, because
+they take no credentials, say the same thing to everyone, and are what the site polls, and
+15 seconds is half a heartbeat interval so a node still shows up promptly. every other
+route keeps `no-store`, which matters for `GET /v1/jobs/<job_id>`, where the job id is the
+only access control, and for every signed route. the header is set in `logic.js` beside
+cors, so it is under test too.
+
 ## storage
 
 kv has no compare-and-swap, so nothing is ever read-modify-written by two paths at
 once, with one exception noted below. there is no shared queue value to lose jobs into.
 
 ```
-node:<node_id>                              node record, no ttl
+node:<node_id>                              node record, 7 day ttl, renewed by every heartbeat
 job:<job_id>                                envelope, status, attempts, lease_until, timestamps, result, receipt
 queue:<node_id>:<created_ms padded>:<job_id> index entry, job_id only
 idem:<to_node>:<idempotency_key>            job_id, so a client retry does not pay twice
@@ -311,6 +325,13 @@ job records carry a ttl: 24 hours after reaching `done` or `failed`, 7 days for 
 that is never pulled. clients must fetch results inside that window. this is what keeps
 the namespace and the queue indexes from growing forever.
 
+node records carry one too: 7 days, pushed out again by every register and every
+heartbeat, so it only ever collects a node that has been silent for a week. that is many
+multiples of the staleness window, and a node that is still running re-registers on the
+first heartbeat 404 and gets its record straight back, so a live node never notices.
+without it every one-off registration sat in the namespace forever and `/v1/stats` paid
+a kv get for each one.
+
 ## limits
 
 | limit | value | response |
@@ -323,7 +344,7 @@ the namespace and the queue indexes from growing forever.
 | queued jobs per to_node | 100 | 429 |
 | jobs per pull | 10 | truncated |
 | nodes per list page | 50 default, 200 max | paged with cursor |
-| node records scanned by /v1/stats | 20 pages | partial totals |
+| node records scanned by /v1/stats | 800 kv gets, 20 pages | `"partial": true` |
 
 the body cap sits above the blob cap so a maximum blob plus its json framing still
 fits, and every kv value stays far under the 25 MiB kv value cap.

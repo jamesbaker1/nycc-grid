@@ -12,6 +12,12 @@ routes = [
 # members only: every submit then needs a card signed by this key plus a member
 # signature. it is a public key, so it belongs in the file rather than in a secret.
 # set it in the same deploy as the members' cards or the grid stops accepting work.
+#
+# the operational rule: gating happens by committing the real key into this file and
+# deploying that commit. never gate by editing the dashboard, and never by editing this
+# line locally without committing it. [vars] is redeployed in full on every `wrangler
+# deploy`, so the next deploy from a clean checkout would overwrite the gate with the
+# empty default below and reopen submission to anyone, silently and with no error.
 [vars]
 CLUB_VERIFY_KEY = ""
 

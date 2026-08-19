@@ -56,6 +56,26 @@ _ENVELOPE_FIELDS = ("job_id", "to_node", "blob_b64", "reply_pubkey", "status")
 _BAD = object()
 
 
+def js_round_trip(doc: object) -> object:
+    """what a document looks like after the deployed coordinator has re-emitted it.
+
+    the real worker is javascript: it JSON.parses a request body and JSON.stringifies
+    the response, and javascript has one number type, so 65.0 arrives back as 65. this
+    mock keeps python objects and therefore keeps the float, which is the one production
+    behaviour it does not reproduce, so a test that cares has to apply this itself.
+
+    written out here rather than reusing crypto._js_numbers on purpose: a regression test
+    that agreed with the implementation by construction would catch nothing.
+    """
+    if isinstance(doc, float) and doc.is_integer():
+        return int(doc)
+    if isinstance(doc, dict):
+        return {k: js_round_trip(v) for k, v in doc.items()}
+    if isinstance(doc, list):
+        return [js_round_trip(v) for v in doc]
+    return doc
+
+
 class _MockServer:
     """shared lifecycle: ephemeral loopback port, daemon threads, clean close."""
 

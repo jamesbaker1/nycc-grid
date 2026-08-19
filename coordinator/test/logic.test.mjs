@@ -28,8 +28,11 @@ import {
   STALE_MS,
   NODES_LIMIT_DEFAULT,
   DONE_TTL_S,
+  NODE_TTL_S,
   CORS_HEADERS,
+  PUBLIC_CACHE_HEADERS,
   STATS_JOBS_DONE_KEY,
+  STATS_MAX_GETS,
   DEFAULT_NEIGHBORHOOD,
 } from '../src/logic.js';
 
@@ -473,6 +476,24 @@ test('heartbeat with a bad signature does not touch last_seen', async () => {
   );
   assert.equal(res.status, 401);
   assert.equal(JSON.parse(storage.map.get('node:alpha')).last_seen, T0);
+});
+
+test('node records expire, and every heartbeat pushes the expiry out again', async () => {
+  const { env, storage, clock } = setup();
+  await registerNode(env);
+  assert.equal(storage.ttls.get('node:alpha'), NODE_TTL_S);
+  assert.equal(NODE_TTL_S, 7 * 24 * 60 * 60);
+  assert.ok(NODE_TTL_S * 1000 > STALE_MS * 100, 'a ttl near STALE_MS would evict live nodes');
+
+  // a v1 record written with no ttl gets one from the next beat
+  storage.ttls.set('node:alpha', undefined);
+  clock.ms = T0 + 45_000;
+  const res = await handleRequest(
+    signReq(env, 'POST', '/v1/nodes/heartbeat', { body: { node_id: 'alpha', wattage: 10 } }),
+    env,
+  );
+  assert.equal(res.status, 200);
+  assert.equal(storage.ttls.get('node:alpha'), NODE_TTL_S);
 });
 
 // ------------------------------------------------------------------- node list
@@ -1248,6 +1269,15 @@ test('canonicalJson refuses anything python would not have produced here', () =>
   assert.equal(canonicalJson(undefined), null);
 });
 
+test('canonicalJson writes an integral number the way python now writes it', () => {
+  // javascript has one number type, so 65.0 and 65 are the same value here and there is
+  // nothing to choose between them. pygrid.crypto.canonical_json collapses integral
+  // floats for exactly this reason: a receipt the node signed over "watts":65 has to
+  // canonicalize to the same bytes once it has been through this worker's JSON.parse.
+  assert.equal(canonicalJson({ watts: 65.0 }), '{"watts":65}');
+  assert.equal(canonicalJson({ watts: 65 }), canonicalJson({ watts: 65.0 }));
+});
+
 test('decodeCardHeader takes base64 utf8 json and nothing else', () => {
   const doc = cardDoc();
   assert.deepEqual(decodeCardHeader(cardHeader(doc)), doc);
@@ -1663,6 +1693,29 @@ test('stats pages through every node record, not just the first page', async () 
   assert.ok(pages > 1, 'expected the cursor loop to run');
 });
 
+test('stats stops at the kv get budget and reports a partial answer', async () => {
+  const { env, storage } = setup();
+  // more node records than one invocation is allowed to read. the platform kills the
+  // invocation at 1000 kv operations, so the honest answer is a short one, not a 500.
+  for (let i = 0; i < STATS_MAX_GETS + 5; i++) {
+    await storage.put(`node:n${String(i).padStart(4, '0')}`, {
+      node_id: `n${i}`,
+      pubkey: A_BOX,
+      verify_key: A_VERIFY,
+      wattage: 1,
+      watts_source: 'claimed',
+      neighborhood: 'bed-stuy',
+      last_seen: T0,
+      registered_ms: T0,
+    });
+  }
+  const res = await handleRequest(makeReq('GET', '/v1/stats'), env);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.partial, true);
+  assert.equal(res.body.nodes_alive, STATS_MAX_GETS);
+  assert.equal(res.body.watts, STATS_MAX_GETS);
+});
+
 // -------------------------------------------------------------------- cors
 
 test('every v1 response carries the cors headers, including errors', async () => {
@@ -1678,6 +1731,33 @@ test('every v1 response carries the cors headers, including errors', async () =>
     assert.equal(res.headers['access-control-allow-origin'], '*');
     assert.equal(res.headers['access-control-allow-methods'], 'GET, POST, OPTIONS');
     assert.equal(res.headers['access-control-max-age'], '86400');
+  }
+});
+
+test('the two public read routes are cacheable and every other route is not', async () => {
+  const { env } = setup();
+  await registerNode(env);
+  const job = await submitJob(env);
+
+  for (const path of ['/v1/nodes', '/v1/stats']) {
+    const res = await handleRequest(makeReq('GET', path), env);
+    assert.equal(res.headers['cache-control'], PUBLIC_CACHE_HEADERS['cache-control'], path);
+    // the cache header rides on top of cors, it does not replace it
+    assert.equal(res.headers['access-control-allow-origin'], '*', path);
+    assert.ok(res.headers['access-control-allow-headers'], path);
+  }
+  assert.equal(PUBLIC_CACHE_HEADERS['cache-control'], 'public, max-age=15');
+
+  // everything else sets nothing here and keeps the no-store default worker.js applies.
+  // job status is per caller and the signed routes must never come out of a cache.
+  const uncacheable = [
+    await handleRequest(makeReq('GET', `/v1/jobs/${job.body.job_id}`), env),
+    await handleRequest(signReq(env, 'GET', '/v1/jobs/pull?node_id=alpha'), env),
+    await handleRequest(makeReq('POST', '/v1/jobs', { body: { to_node: 'alpha' } }), env),
+    await handleRequest(makeReq('GET', '/healthz'), env),
+  ];
+  for (const res of uncacheable) {
+    assert.equal(res.headers && res.headers['cache-control'], undefined);
   }
 });
 

@@ -353,6 +353,31 @@ def test_cli_issue_with_an_existing_member_key(tmp_path, capsys, member):
     assert doc["card"]["member_verify_key"] == member["verify_key"]
 
 
+def test_cli_issue_refuses_to_clobber_an_existing_member_keyfile(tmp_path, capsys):
+    """the keyfile name is fixed, so issuing twice into one directory would destroy the
+    first member's signing key, which is the only thing their card can sign with."""
+    keys_path = str(tmp_path / "club.keys.json")
+    _run(["init", "--keys", keys_path], capsys)
+    code, _out = _run(
+        ["issue", "--member", "james baker", "--member-keygen",
+         "--out", str(tmp_path / "card.json"), "--keys", keys_path],
+        capsys,
+    )
+    assert code == 0
+    first = (tmp_path / "member.keys.json").read_text(encoding="utf-8")
+
+    code = club.main(
+        ["issue", "--member", "somebody else", "--member-keygen",
+         "--out", str(tmp_path / "second.json"), "--keys", keys_path]
+    )
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "member.keys.json" in err and "--out" in err
+    assert (tmp_path / "member.keys.json").read_text(encoding="utf-8") == first
+    # refused before anything was written, so there is no half-made card either
+    assert not (tmp_path / "second.json").exists()
+
+
 def test_cli_issue_needs_a_member_key(tmp_path, capsys):
     keys_path = str(tmp_path / "club.keys.json")
     _run(["init", "--keys", keys_path], capsys)

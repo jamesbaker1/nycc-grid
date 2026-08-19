@@ -37,7 +37,7 @@ coordinator/
   src/worker.js  thin adapter: routes, webcrypto verify, KV io. ships untested
   wrangler.toml  deploy config. real production kv id, live custom domain
 tests/           pytest, loopback only
-docs/            threat model
+docs/            threat model, and the attestation design that is not built
 ```
 
 ## install
@@ -146,10 +146,14 @@ a card is an ed25519 certificate the club signs for a member:
 ```
 
 the signed bytes are the card with no `sig` in it, serialized as
-`json.dumps(card, sort_keys=True, separators=(",", ":"))` and utf-8 encoded. that is
-`crypto.canonical_json()`, and `logic.js` rebuilds the same bytes in javascript, escapes and
-all. it is a different rule from request signing on purpose: a request signs the raw bytes on
-the wire, a card is re-serialized by whoever checks it.
+`json.dumps(card, sort_keys=True, separators=(",", ":"))` and utf-8 encoded, with every
+integral float written as an int. that is `crypto.canonical_json()`, and `logic.js` rebuilds
+the same bytes in javascript, escapes and all. the integer rule is there because javascript
+has one number type: `JSON.stringify(65.0)` is `65`, and the coordinator re-serializes
+everything it forwards, so a python `65.0` would otherwise canonicalize to different bytes on
+the two sides and the signature would fail after the trip. it is a different rule from request
+signing on purpose: a request signs the raw bytes on the wire, a card or a receipt is
+re-serialized by whoever checks it.
 
 ```
 python -m pygrid.club init
@@ -162,9 +166,11 @@ python -m pygrid.club svg card.json --out card.svg
 invalidates every card ever issued and there is no revocation list to undo that with.
 `issue --member-keygen` also writes `member.keys.json` next to the card: that file is the
 member's ed25519 signing key, unencrypted, and it is the half that actually authenticates.
-the card without it is a name in a json file. `svg` renders the printable card, 856 by 540,
-with the member name, the serial, the issue date and the sha256 fingerprint of the member
-verify key.
+the card without it is a name in a json file. the keyfile name is fixed, so issuing a second
+member into the same directory is refused rather than allowed to overwrite the first
+member's key: give each member their own `--out` directory. `svg` renders the printable
+card, 856 by 540, with the member name, the serial, the issue date and the sha256
+fingerprint of the member verify key.
 
 a client carries the pair on submission:
 
@@ -277,6 +283,11 @@ OPTIONS`, `content-type` plus every `x-nycc-*` header in use, and a 24 hour pref
 `OPTIONS` anywhere under `/v1/` answers 204. the wildcard grants nothing: authentication is a
 signature over the request, not a cookie or an origin, so a browser reaching the api from any
 page can do exactly what an unauthenticated curl can do.
+
+the two public reads, `GET /v1/nodes` and `GET /v1/stats`, answer
+`Cache-Control: public, max-age=15`, because they take no credentials and the site polls
+them. every other route is `no-store`, including `GET /v1/jobs/<job_id>`, where the job id
+is the only thing standing between a result and whoever asks for it.
 
 when submission is gated, a rejected `POST /v1/jobs` is a 403 with a machine readable `code`:
 
@@ -400,10 +411,15 @@ by calling `crypto.signing_message()` rather than by writing the string out agai
 - **no scheduling, no fairness, no billing.** jobs go to one node, in order, and nothing
   tracks who used how much of whose gpu. a card says who asked, not what they are owed.
 
-`docs/THREAT_MODEL.md` was written against v1 and still reads that way in places: it lists
-signed results, membership authentication and measured wattage as unstarted v2 candidates.
-they are the three features above. everything it says about what remains broken is still
-true.
+`docs/THREAT_MODEL.md` is the contract for what this repo does and does not protect, and it
+now reads against protocol v2: receipts, the card gate and measured watts sit in the
+implemented list with what each one is actually worth written beside it. everything it says
+about what remains broken is still true.
+
+`docs/ATTESTATION.md` is the design for the largest of those gaps, the one where a node
+reads every job you send it: the candidate mechanisms, what each fails to cover, why a
+club is a strange place to want this, and the phased plan for where it would plug in.
+nothing in it is implemented, and it opens by saying so.
 
 ## a note on the club voice
 

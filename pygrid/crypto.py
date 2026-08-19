@@ -155,15 +155,42 @@ def new_nonce() -> str:
 def canonical_json(doc: Any) -> bytes:
     """the one byte string a signed json document is signed over.
 
-    sorted keys, no whitespace, utf-8. used by member cards (pygrid.club) and job
-    receipts (pygrid.node), so a verifier that can rebuild the dict can rebuild the
-    signed bytes without keeping the original serialization around.
+    sorted keys, no whitespace, utf-8, and every integral float written as an int. used
+    by member cards (pygrid.club) and job receipts (pygrid.node), so a verifier that can
+    rebuild the dict can rebuild the signed bytes without keeping the original
+    serialization around.
+
+    the integral float rule is the one that is not obvious. these documents cross into
+    javascript: the coordinator JSON.parses a body and JSON.stringifies it back out, and
+    javascript has a single number type, so 65.0 and 65 are the same value and
+    JSON.stringify prints "65" for both. python would print "65.0", the two canonical
+    byte strings would differ, and the node's signature over a receipt with integral
+    watts would fail to verify on the client after the round trip. collapsing here makes
+    both sides agree, and it covers any float a future card carries too, since the
+    coordinator re-canonicalizes cards in javascript.
+
+    non-integral floats are left alone. the only ones in this protocol come from
+    round(x, 1) watts, whose shortest repr is the same string in python and javascript.
 
     this is for documents that are re-serialized by whoever verifies them. request
     bodies are never canonicalized: those sign the raw bytes on the wire, see
     signing_message().
     """
-    return json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(_js_numbers(doc), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _js_numbers(doc: Any) -> Any:
+    """the document with every integral float replaced by the int javascript prints.
+
+    bools are not touched: bool is an int subclass, not a float. see canonical_json.
+    """
+    if isinstance(doc, float) and doc.is_integer():
+        return int(doc)
+    if isinstance(doc, dict):
+        return {k: _js_numbers(v) for k, v in doc.items()}
+    if isinstance(doc, (list, tuple)):
+        return [_js_numbers(v) for v in doc]
+    return doc
 
 
 def signing_message(

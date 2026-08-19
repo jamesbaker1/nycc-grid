@@ -40,6 +40,13 @@ export const NODES_LIMIT_MAX = 200;
 export const DONE_TTL_S = 24 * 60 * 60;
 export const QUEUED_TTL_S = 7 * 24 * 60 * 60;
 
+// node records expire too, or a namespace collects every one-off registration forever
+// and the stats scan pays for all of them. 7 days is many multiples of STALE_MS, so a
+// record only lapses long after the node stopped counting as alive, and a node that is
+// still running re-registers on the first heartbeat 404 (see handleHeartbeat) and gets
+// its record back. a live node therefore never notices this.
+export const NODE_TTL_S = 7 * 24 * 60 * 60;
+
 // a node that sends no neighborhood is filed here rather than dropped from the map.
 export const DEFAULT_NEIGHBORHOOD = 'undisclosed';
 export const WATTS_SOURCES = ['measured', 'claimed'];
@@ -55,6 +62,10 @@ export const STATS_JOBS_DONE_KEY = '__stats__:jobs_done';
 // bounded so a namespace with a runaway number of node records cannot hang the edge.
 const STATS_PAGE = 1000;
 const STATS_MAX_PAGES = 20;
+// a worker invocation is capped at 1000 kv operations, and this route spends one get
+// per node record. stop under the cap and say the answer is short: the alternative is
+// a namespace that grows past it and turns /v1/stats into a permanent 500.
+export const STATS_MAX_GETS = 800;
 
 export const CORS_HEADERS = Object.freeze({
   'access-control-allow-origin': '*',
@@ -64,6 +75,13 @@ export const CORS_HEADERS = Object.freeze({
     'x-nycc-card, x-nycc-member-ts, x-nycc-member-nonce, x-nycc-member-sig',
   'access-control-max-age': '86400',
 });
+
+// the two public read routes, and only those, are cacheable. they take no credentials,
+// answer the same thing to everyone, and are what the site polls; 15 seconds is half a
+// heartbeat interval, so a node still appears promptly. every other route keeps the
+// no-store default worker.js applies, which matters because job status is a per-caller
+// secret and the signed routes must never be served from a cache.
+export const PUBLIC_CACHE_HEADERS = Object.freeze({ 'cache-control': 'public, max-age=15' });
 
 const KEY_BYTES = 32;
 const enc = new TextEncoder();
@@ -130,8 +148,11 @@ function isKey32(v) {
   return raw !== null && raw.length === KEY_BYTES;
 }
 
-function json(status, body) {
-  return { status, body };
+// headers is optional and carries only what a route needs for itself. cors is added
+// later, in handleRequest, for every /v1 path, and worker.js spreads whatever lands
+// here over its own no-store default.
+function json(status, body, headers) {
+  return headers ? { status, body, headers } : { status, body };
 }
 
 // 403 plus a stable machine readable code. the message is for humans reading logs,
@@ -470,16 +491,20 @@ async function handleRegister(req, env) {
   const now = env.now();
   // register is a full upsert: re-registering without a neighborhood files the node
   // back under "undisclosed" rather than silently keeping the old pin.
-  await env.storage.put(nodeKey(nodeId), {
-    node_id: nodeId,
-    pubkey: body.pubkey,
-    verify_key: body.verify_key,
-    wattage,
-    watts_source: wattsSource,
-    neighborhood,
-    last_seen: now,
-    registered_ms: existing ? existing.registered_ms : now,
-  });
+  await env.storage.put(
+    nodeKey(nodeId),
+    {
+      node_id: nodeId,
+      pubkey: body.pubkey,
+      verify_key: body.verify_key,
+      wattage,
+      watts_source: wattsSource,
+      neighborhood,
+      last_seen: now,
+      registered_ms: existing ? existing.registered_ms : now,
+    },
+    { expirationTtl: NODE_TTL_S },
+  );
   return json(200, { ok: true, node_id: nodeId, rotated: Boolean(existing) });
 }
 
@@ -514,7 +539,9 @@ async function handleHeartbeat(req, env) {
     node.watts_source = body.watts_source;
   }
   node.last_seen = env.now();
-  await env.storage.put(nodeKey(nodeId), node);
+  // every beat pushes the expiry out again, so the ttl only ever catches a node that
+  // stopped talking a week ago, not one that is quietly idle.
+  await env.storage.put(nodeKey(nodeId), node, { expirationTtl: NODE_TTL_S });
   return json(200, { ok: true, node_id: nodeId });
 }
 
@@ -549,7 +576,7 @@ async function handleListNodes(req, env) {
   }
   const out = { nodes };
   if (!listed.list_complete && listed.cursor) out.cursor = listed.cursor;
-  return json(200, out);
+  return json(200, out, PUBLIC_CACHE_HEADERS);
 }
 
 // counter reads are defensive: a hand edited or half written kv value reads as zero
@@ -579,11 +606,20 @@ async function handleStats(req, env) {
   let nodesAlive = 0;
   let watts = 0;
   let wattsMeasured = 0;
+  // the get budget is spent before the staleness filter, because a record has to be read
+  // to know whether it is stale. partial says the totals are a floor, not the whole grid.
+  let gets = 0;
+  let partial = false;
   const hoods = new Map();
 
-  for (let page = 0; page < STATS_MAX_PAGES; page++) {
+  for (let page = 0; page < STATS_MAX_PAGES && !partial; page++) {
     const listed = await env.storage.list({ prefix: 'node:', limit: STATS_PAGE, cursor });
     for (const k of listed.keys) {
+      if (gets >= STATS_MAX_GETS) {
+        partial = true;
+        break;
+      }
+      gets += 1;
       const rec = await env.storage.get(k.name);
       if (!rec) continue;
       if (now - rec.last_seen > STALE_MS) continue;
@@ -602,20 +638,25 @@ async function handleStats(req, env) {
     }
     if (listed.list_complete || !listed.cursor) break;
     cursor = listed.cursor;
+    // the page cap ends the scan just as short as the get budget does
+    if (page === STATS_MAX_PAGES - 1) partial = true;
   }
 
   const neighborhoods = [...hoods.values()]
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
     .map((h) => ({ name: h.name, nodes: h.nodes, watts: round1(h.watts) }));
 
-  return json(200, {
+  const out = {
     ok: true,
     nodes_alive: nodesAlive,
     watts: round1(watts),
     watts_measured: round1(wattsMeasured),
     jobs_done: await readCounter(env, STATS_JOBS_DONE_KEY),
     neighborhoods,
-  });
+  };
+  // absent on a complete scan, so a healthy grid answers exactly the shape it always did
+  if (partial) out.partial = true;
+  return json(200, out, PUBLIC_CACHE_HEADERS);
 }
 
 async function handleSubmit(req, env) {

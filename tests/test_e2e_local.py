@@ -23,7 +23,13 @@ import pytest
 from pygrid import club, crypto
 from pygrid.client import CoordinatorError, GridClient, JobFailed
 from pygrid.node import NodeAgent
-from pygrid.testkit import MAX_ATTEMPTS, MAX_QUEUED_PER_NODE, MockCoordinator, MockEngine
+from pygrid.testkit import (
+    MAX_ATTEMPTS,
+    MAX_QUEUED_PER_NODE,
+    MockCoordinator,
+    MockEngine,
+    js_round_trip,
+)
 
 # distinctive enough that finding it anywhere in a recorded body means a real leak
 PROMPT = "nycc-plaintext-canary hudson yards diesel generator poem"
@@ -520,6 +526,37 @@ def test_receipt_round_trip_verifies(coord, engine):
     assert body["request_sha256"] == hashlib.sha256(job_blob).hexdigest()
     result_blob = base64.b64decode(client.status(job_id)["blob_b64"])
     assert body["result_sha256"] == hashlib.sha256(result_blob).hexdigest()
+
+
+def test_a_receipt_verifies_after_a_javascript_json_round_trip(coord, engine):
+    """the deployed coordinator is javascript. it JSON.parses the result body and
+    JSON.stringifies it back out, and JSON.stringify prints 65 for 65.0, so the client
+    re-canonicalizes different bytes than the node signed unless both sides collapse
+    integral floats. this mock keeps the python float, so the round trip is applied by
+    hand: without it every integral-watts receipt verified in the tests and failed in
+    production."""
+    agent = _agent(coord, engine, node_id="node-gowanus", wattage=65.0)
+    # pinned after construction, so this is a test about the round trip rather than about
+    # whatever meter the machine running it happens to have
+    agent.wattage = 65.0
+    agent.watts_source = "claimed"
+    agent.run_once()
+
+    client = GridClient(coord.url)
+    job_id = client.submit(PROMPT, max_tokens=8)
+    assert agent.run_once() == 1
+
+    with coord.lock:
+        stored = coord.jobs[job_id]["receipt"]
+        assert isinstance(stored["receipt"]["watts"], float)
+        coord.jobs[job_id]["receipt"] = js_round_trip(stored)
+        assert coord.jobs[job_id]["receipt"]["receipt"]["watts"] == 65
+        assert isinstance(coord.jobs[job_id]["receipt"]["receipt"]["watts"], int)
+
+    text, receipt, verified = client.result_with_receipt(job_id, timeout=5)
+    assert verified is True
+    assert text == "echo: " + PROMPT
+    assert _receipt_body(receipt)["watts"] == 65
 
 
 def test_a_tampered_receipt_does_not_verify(coord, engine):
