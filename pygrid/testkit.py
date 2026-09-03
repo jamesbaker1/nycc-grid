@@ -46,6 +46,7 @@ MAX_QUEUED_PER_NODE = 100
 HEARTBEAT_S = 30.0
 STALE_AFTER_S = 3 * HEARTBEAT_S
 DEFAULT_NODES_LIMIT = 50
+NODES_LIMIT_MAX = 200
 
 NODE_ID_HEADER = "X-NYCC-Node-Id"
 
@@ -203,7 +204,7 @@ class MockCoordinator(_MockServer):
     def __init__(self, club_verify_key: str | None = None) -> None:
         self.nodes: dict[str, dict] = {}
         self.jobs: dict[str, dict] = {}
-        self.idempotency: dict[str, str] = {}
+        self.idempotency: dict[tuple[str, str], str] = {}
         self.club_verify_key = club_verify_key or ""
         # (member verify key, nonce) -> unix seconds. the worker keeps this in KV with a
         # TTL; here it grows for the life of the process, which is a few seconds.
@@ -495,7 +496,7 @@ class _CoordinatorHandler(_JsonHandler):
 
     def _list_nodes(self, query: dict) -> None:
         limit = _int(query.get("limit", [DEFAULT_NODES_LIMIT])[0], DEFAULT_NODES_LIMIT)
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(limit, NODES_LIMIT_MAX))
         cursor = query.get("cursor", [None])[0]
         mock = self.mock
         with mock.lock:
@@ -522,13 +523,16 @@ class _CoordinatorHandler(_JsonHandler):
             self._send(413, {"error": "blob_b64 over 1 MiB"})
             return
         idem = body.get("idempotency_key")
+        # scoped per to_node, matching logic.js's idem:${toNode}:${key}: a shared
+        # namespace would hand one client another client's job_id.
+        idem_key = (to_node, idem) if isinstance(idem, str) and idem else None
         mock = self.mock
         with mock.lock:
             if to_node not in mock.nodes:
                 self._send(404, {"error": "unknown to_node"})
                 return
-            if isinstance(idem, str) and idem in mock.idempotency:
-                self._send(200, {"job_id": mock.idempotency[idem], "duplicate": True})
+            if idem_key is not None and idem_key in mock.idempotency:
+                self._send(200, {"job_id": mock.idempotency[idem_key], "duplicate": True})
                 return
             if mock.queued_count(to_node) >= MAX_QUEUED_PER_NODE:
                 self._send(429, {"error": "per-node queue is full"})
@@ -547,8 +551,8 @@ class _CoordinatorHandler(_JsonHandler):
                 "created_ms": _now_ms(),
                 "seq": mock._next_seq(),
             }
-            if isinstance(idem, str) and idem:
-                mock.idempotency[idem] = job_id
+            if idem_key is not None:
+                mock.idempotency[idem_key] = job_id
         self._send(200, {"job_id": job_id})
 
     def _pull(self, query: dict) -> None:

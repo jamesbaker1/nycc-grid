@@ -100,7 +100,12 @@ the nonce is written, so an unauthenticated caller cannot burn a node's nonce sp
 `POST /v1/jobs` shipped open in v1: anyone who could reach the worker could queue work
 onto a member's gpu. v2 can gate it on a club membership card, and does that only when
 `CLUB_VERIFY_KEY` is set in `[vars]`. empty or unset means open submission, byte for
-byte the v1 behavior, so deploying this file changes nothing on its own.
+byte the v1 behavior.
+
+it is set. commit 767312e committed the real key into `wrangler.toml`, and the deployed
+coordinator has run gated since: submission is members only. verified 2026-09-03, an
+uncarded `POST /v1/jobs` came back 403 `{"error": "member card required", "code":
+"card_required"}`, checked in `handleSubmit` before the body is parsed.
 
 a card is issued by `python -m pygrid.club` and looks like:
 
@@ -365,10 +370,12 @@ wrangler kv namespace create GRID --preview
 then add the id it prints as `preview_id` under `[[kv_namespaces]]`. a dev run against
 the production namespace can overwrite a live job record or a node's registered key.
 
-`CLUB_VERIFY_KEY` ships empty, which keeps submission open exactly as it is today. it is
-a public key, so it lives in `[vars]` rather than in a secret. setting it is a one way
-door for anyone without a card: the moment it deploys, every uncarded submit is a 403.
-issue the cards first, then set it.
+`CLUB_VERIFY_KEY` ships empty by default, which would keep submission open. it is a
+public key, so it lives in `[vars]` rather than in a secret. setting it is a one way door
+for anyone without a card: the moment it deploys, every uncarded submit is a 403. issue
+the cards first, then set it. commit 767312e set it — the real key has been committed and
+deployed since, so submission is members only today, verified 2026-09-03 by an uncarded
+`POST /v1/jobs` coming back 403 `card_required`.
 
 ## status, honestly
 
@@ -380,10 +387,12 @@ issue the cards first, then set it.
 - ed25519 in webcrypto is named differently across workers runtime versions, so
   `worker.js` tries two spellings. which one this compatibility date gets is unverified.
   the club and member signatures go through that same unverified import.
-- `POST /v1/jobs` is unauthenticated while `CLUB_VERIFY_KEY` is empty, which is how it
-  is deployed right now. anyone who can reach the worker can queue work onto a member's
-  gpu, up to the per-node cap. setting the key gates submission on a card and nothing
-  else: there is still no quota, and cards have no revocation and no expiry.
+- `POST /v1/jobs` would be unauthenticated while `CLUB_VERIFY_KEY` is empty, but that is
+  not how it is deployed: the key has been committed and live since commit 767312e, so
+  submission is gated on a card, verified in production 2026-09-03 (uncarded submit, 403
+  `card_required`). gating is all it does: there is still no quota, and cards have no
+  revocation and no expiry. the card is not bound to the job either, so the coordinator
+  now sees a member name on every submission without recording which job it went with.
 - first-time `POST /v1/nodes/register` is unauthenticated. it proves possession of the
   key in the body, not membership. first-come node id squatting works. re-registration
   is protected, initial claim is not. cards gate submission only, not registration.

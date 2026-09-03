@@ -80,18 +80,24 @@ what a verified receipt says is that this node's key stands behind this exact re
 ciphertext. it does not make the watts or the timings in it true, and it is not an
 attestation that the engine ran what it claims. section 5 still applies to the numbers.
 
-## 3. job submission is open unless the club key is set, and first registration is open either way
+## 3. job submission is members only now, and first registration is open either way
 
-`POST /v1/jobs` is card-gated only when the coordinator has `CLUB_VERIFY_KEY` configured.
-it ships empty and the deployed coordinator runs that way, so submission is open today:
-anyone who can reach it can queue work onto members' gpus, up to the per node cap of 100
-queued jobs and the 1 MiB blob cap.
+`POST /v1/jobs` is card-gated when the coordinator has `CLUB_VERIFY_KEY` configured. that
+key ships empty by default, which keeps submission exactly as open as v1: anyone who can
+reach it can queue work onto members' gpus, up to the per node cap of 100 queued jobs and
+the 1 MiB blob cap. that default is not what is deployed. commit 767312e committed the real
+key into `wrangler.toml`, and the coordinator has run gated since. verified 2026-09-03: an
+uncarded submit returns 403 `{"error": "member card required", "code": "card_required"}`,
+checked in `handleSubmit` before the body is parsed, so nothing in the body changes the
+outcome.
 
-set the key and every submit needs a card the club signed plus a member signature, and an
-uncarded submit is a 403. what that buys is narrow. cards have no expiry and no revocation,
-so one is good until the club rotates its key, which invalidates every member's card at
-once. there is still no quota and no accounting: the queue cap and its 429 remain the only
-backpressure. and it gates submission only.
+every submit now needs a card the club signed plus a member signature. what that buys is
+narrow. cards have no expiry and no revocation, so one is good until the club rotates its
+key, which invalidates every member's card at once. there is still no quota and no
+accounting: the queue cap and its 429 remain the only backpressure, same as before the gate.
+and the gate is submission only — the card is not bound to the job, so the coordinator now
+sees a member name on every submission, metadata about who asked, not an attribution
+recorded against that job.
 
 `POST /v1/nodes/register` for a new node_id is open with or without a club key. the
 signature proves possession of the key in the body, not membership of the club. anyone can

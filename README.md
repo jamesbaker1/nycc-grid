@@ -184,11 +184,13 @@ path) and `NYCC_MEMBER_SIGNKEY` (the seed itself, never argv). the card rides in
 string node requests use, under `X-NYCC-Member-Ts`, `X-NYCC-Member-Nonce` and
 `X-NYCC-Member-Sig`.
 
-**the gate only exists when the coordinator has the club key.** the worker reads
-`CLUB_VERIFY_KEY` from `[vars]` in `wrangler.toml`. it ships empty, and empty means
-`POST /v1/jobs` is exactly as open as it was in v1: no card required, cards ignored if sent.
-set it and submission becomes members only. that default is deliberate, so deploying v2 does
-not lock the grid out of itself.
+**the gate is on.** the worker reads `CLUB_VERIFY_KEY` from `[vars]` in `wrangler.toml`.
+empty means `POST /v1/jobs` is exactly as open as it was in v1: no card required, cards
+ignored if sent. that empty default was deliberate, so deploying v2 would not lock the grid
+out of itself — but it is not what is deployed. commit 767312e committed the real key into
+`wrangler.toml`, and production has run gated since. verified 2026-09-03: an uncarded
+`POST /v1/jobs` came back 403 `{"error": "member card required", "code": "card_required"}`,
+checked in `handleSubmit` (`logic.js`) before the body is parsed.
 
 what a card proves when the gate is on: the club's key signed this member name together with
 this member verify key, and whoever sent the request holds that key. the nonce and the 300
@@ -381,9 +383,12 @@ by calling `crypto.signing_message()` rather than by writing the string out agai
 - **receipts are reported, not enforced.** `result()` returns text regardless, and the cli
   prints `FAILED VERIFICATION` and exits 0. the property only exists for code that reads the
   boolean.
-- **submission is open unless you configure it.** `CLUB_VERIFY_KEY` ships empty, so today
-  `POST /v1/jobs` still has no client identity, no quota, and no accounting. the per node
-  queue cap is the only backpressure.
+- **submission is members only.** `CLUB_VERIFY_KEY` has been committed since commit
+  767312e, and production has run gated since: an uncarded `POST /v1/jobs` is a 403
+  `card_required`, verified 2026-09-03. that buys narrow — still no quota and no
+  accounting, and the card is not bound to the job, so the coordinator now sees a member
+  name on every submission without attributing it to that job. the per node queue cap
+  remains the only backpressure.
 - **cards have no expiry and no revocation.** `issued` is printed, not enforced. losing a
   member keyfile means minting a new card and rotating the club key, which invalidates every
   other member's card too.
